@@ -1,1 +1,11 @@
+[package]
+-> name => nula
+-> version => 0.1.0
+-> description => Menedżer pakietów i łącznik H# <-> Z# (+ Hacker Lang / Hacker Lang++), napisany w 100% w Z#
+-> license => Apache-2.0
+-> lang => [z#]
 
+[build]
+-> main => z#
+-> profile => release
+-> backend => c
