@@ -1,0 +1,128 @@
+namespace Resolve;
+
+import Std.Os;
+import Workspace.Util;
+import Workspace.Ui;
+import Workspace.Semver;
+import Workspace.Scan;
+import Workspace.Registry;
+import Workspace.Fetch;
+import Workspace.Lock;
+import Workspace.Project;
+
+##
+ * Resolve — od kodu do nula.lock.
+ *   1. Scan.project       importy z src/, mod/, source-code/  →  zależności bezpośrednie
+ *   2. kolejka (BFS)      dla każdej: piny → indeks → Fetch.install → Scan.package (jej własne importy
+ *                         i jawny Bit.hk / nula.hk) → zależności przechodnie
+ *   3. nula.lock          zapis + dowiązania w build/libs, sprzątanie nieużywanych
+ * W drzewie jest jedna kopia pakietu; niezgodne zakresy kończą się czytelnym błędem (rozwiązanie: [pins]).
+ *
+ * $opts: ["locked" => bool, "offline" => bool, "update" => [nazwy] ("*" = wszystkie), "dry" => bool]
+ * Wynik: ["entries" => [nazwa => wpis], "external" => [rekordy], "direct" => [nazwy]]
+##
+
+func wantsUpdate($opts, $name) {
+    return in_array("*", $opts["update"]) || in_array($name, $opts["update"]);
+}
+
+func all($root, $m, $opts) {
+    $lock = Lock.read($root . "/nula.lock");
+    $queue = Scan.project($root, $m);
+    $direct = [];
+    $done = [];
+    $external = [];
+    $libs = null;
+    for ($i = 0; $i < count($queue); $i++) {
+        $d = $queue[$i];
+        $name = $d["name"];
+        if ($name === $m["name"]) { continue; }
+        if ($d["kind"] === "external") { $external[] = $d; continue; }
+        if ($d["by"] === "") { $direct[] = $name; }
+        # piny: najpierw te z samego pakietu, potem z nula.hk projektu (mają pierwszeństwo)
+        $d = Registry.applyPin($d, $d["pin"]);
+        if (has_key($m["pins"], $name)) { $d = Registry.applyPin($d, $m["pins"][$name]); }
+
+        if (has_key($done, $name)) {
+            $e = $done[$name];
+            if ($d["req"] !== "" && $e["kind"] === "git") {
+                $v = Semver.parse($e["version"]);
+                if ($v === null || !Semver.satisfies($v, $d["req"])) {
+                    throw new Exception("konflikt wersji: `" . $name . "` jest w " . $e["version"] . ", ale " . ($d["by"] === "" ? "projekt" : "`" . $d["by"] . "`") . " wymaga " . $d["req"] . ". W drzewie jest jedna kopia pakietu — ustaw zakres w [pins] nula.hk.");
+                }
+            }
+            continue;
+        }
+        if ($d["kind"] === "registry") {
+            if ($libs === null) { $libs = Registry.libraries($m, $opts["offline"]); }
+            $d = Registry.complete($d, $libs);
+        }
+        $locked = has_key($lock, $name) && !wantsUpdate($opts, $name) ? $lock[$name] : null;
+        if ($opts["locked"] && $locked === null && $d["kind"] !== "path") {
+            throw new Exception("`" . $name . "` nie ma w nula.lock (--locked). Uruchom `nula install` i zacommituj nula.lock.");
+        }
+        $base = $d["by"] !== "" && has_key($done, $d["by"]) ? $done[$d["by"]]["path"] : $root;
+        $e = Fetch.install($d, $base, $locked, $opts["offline"]);
+
+        $pkg = Scan.package($e["path"], $name);
+        $names = [];
+        foreach ($pkg["deps"] as $sd) {
+            if ($sd["name"] === $name) { continue; }
+            $sd["by"] = $name;
+            $queue[] = $sd;
+            if ($sd["kind"] !== "external") { $names[] = $sd["name"]; }
+        }
+        $e["langs"] = $pkg["langs"];
+        $e["deps"] = Util.unique($names);
+        $done[$name] = $e;
+    }
+    return ["entries" => $done, "external" => $external, "direct" => Util.unique($direct)];
+}
+
+# zapis nula.lock + dowiązania w build/libs; zwraca liczbę zmian w lock (0/1)
+func commit($root, $m, $res, $opts) {
+    $changed = 0;
+    if (!$opts["locked"] && !$opts["dry"]) {
+        $entries = [];
+        foreach ($res["entries"] as $n => $e) {
+            $c = $e;
+            if ($e["kind"] !== "path") { $c = []; foreach ($e as $k => $v) { if ($k !== "path" && $k !== "kind") { $c[$k] = $v; } } }
+            else { $c["version"] = "path"; }
+            $entries[$n] = $c;
+        }
+        if (Lock.write($root . "/nula.lock", $entries)) { $changed = 1; }
+    }
+    if (!$opts["dry"]) {
+        foreach ($res["entries"] as $n => $e) { Fetch.link($m, $e); }
+        Fetch.prune($m, keys($res["entries"]));
+    }
+    return $changed;
+}
+
+# `nula tree`: linie drzewa zależności (bez referencji — każda funkcja zwraca swoje linie)
+func treeLines($res) {
+    $out = [];
+    foreach ($res["direct"] as $n) {
+        foreach (treeNode($res, $n, "", true, []) as $l) { $out[] = $l; }
+    }
+    return $out;
+}
+
+func treeNode($res, $name, $prefix, $last, $seen) {
+    $e = $res["entries"][$name];
+    $label = $name . " " . ($e["version"] !== "" ? $e["version"] : Util.firstChars($e["commit"], 8)) . " [" . join($e["langs"], ", ") . "]";
+    $out = [$prefix . $label];
+    if (in_array($name, $seen)) { return $out; }
+    $seen[] = $name;
+    $kids = [];
+    foreach ($e["deps"] as $k) { if (has_key($res["entries"], $k)) { $kids[] = $k; } }
+    for ($i = 0; $i < count($kids); $i++) {
+        $isLast = $i === count($kids) - 1;
+        $sub = treeNode($res, $kids[$i], "", $isLast, $seen);
+        for ($j = 0; $j < count($sub); $j++) {
+            $lead = $j === 0 ? ($isLast ? "└─ " : "├─ ") : ($isLast ? "   " : "│  ");
+            $out[] = $prefix . $lead . $sub[$j];
+        }
+    }
+    return $out;
+}
