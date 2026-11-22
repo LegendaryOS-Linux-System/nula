@@ -1,1 +1,13 @@
+[package]
+-> name        => nula-website
+-> version     => 0.1.0
+-> description => Strona projektu nula (HackerScript, mode:website).
+-> license     => Apache-2.0
+-> lang        => HackerScript
+-> using       => 0.6
 
+[layout]
+-> cmd => cmd
+
+[default-build]
+-> profile => release
