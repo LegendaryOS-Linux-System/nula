@@ -1,0 +1,178 @@
+namespace Util;
+
+import Std.Os;
+import Std.Path;
+
+##
+ * Util — małe, wspólne funkcje nuli: cytowanie powłoki, uruchamianie procesów, sumy kontrolne, sortowanie.
+ * Nazwy świadomie nie powtarzają wbudowanych (split/join/sort/...), bo nazwy modułowe je przesłaniają.
+##
+
+# ───────────────── tekst ─────────────────
+func sq($s) { return "'" . replace($s, "'", "'\\''") . "'"; }
+
+func shellLine($cmd, $args = []) {
+    $p = [sq($cmd)];
+    foreach ($args as $a) { $p[] = sq($a); }
+    return join($p, " ");
+}
+
+# linie tekstu bez \r
+func lines($text) {
+    $out = [];
+    foreach (split($text, "\n") as $l) {
+        if (ends_with($l, "\r")) { $l = substr($l, 0, strlen($l) - 1); }
+        $out[] = $l;
+    }
+    return $out;
+}
+
+# porównanie tekstów po kodach znaków: -1 / 0 / 1
+func cmp($a, $b) {
+    $la = strlen($a);
+    $lb = strlen($b);
+    $n = $la < $lb ? $la : $lb;
+    for ($i = 0; $i < $n; $i++) {
+        $x = ord(substr($a, $i, 1));
+        $y = ord(substr($b, $i, 1));
+        if ($x !== $y) { return $x < $y ? -1 : 1; }
+    }
+    if ($la === $lb) { return 0; }
+    return $la < $lb ? -1 : 1;
+}
+
+# nowa, posortowana lista tekstów (przez wstawianie — listy są małe)
+func sortStrings($list) {
+    $out = [];
+    foreach ($list as $x) {
+        $i = count($out);
+        $out[] = $x;
+        while ($i > 0 && cmp($out[$i - 1], $x) > 0) {
+            $out[$i] = $out[$i - 1];
+            $i--;
+        }
+        $out[$i] = $x;
+    }
+    return $out;
+}
+
+# lista bez powtórzeń (zachowuje kolejność pierwszych wystąpień)
+func unique($list) {
+    $out = [];
+    foreach ($list as $x) { if (!in_array($x, $out)) { $out[] = $x; } }
+    return $out;
+}
+
+func firstChars($s, $n) { return strlen($s) <= $n ? $s : substr($s, 0, $n); }
+
+func isHex($s) {
+    if ($s === "") { return false; }
+    for ($i = 0; $i < strlen($s); $i++) { if (!is_hex_digit(substr($s, $i, 1))) { return false; } }
+    return true;
+}
+
+# ───────────────── procesy ─────────────────
+# Process.run, ale bez wyjątku: brak programu = status 127
+func run($cmd, $args = []) {
+    try { return Process.run($cmd, $args); }
+    catch (Exception $e) { return ["status" => 127, "stdout" => "", "stderr" => $e->getMessage()]; }
+}
+
+# stdout przyciętego polecenia albo null przy błędzie
+func capture($cmd, $args = []) {
+    $r = run($cmd, $args);
+    if ($r["status"] !== 0) { return null; }
+    return trim($r["stdout"]);
+}
+
+# uruchamia z dziedziczeniem strumieni; zwraca kod wyjścia
+func inherit($cmd, $args = []) {
+    if (Os.env("NULA_VERBOSE", "") === "1") { eecho("+ " . shellLine($cmd, $args)); }
+    try { return Process.exec($cmd, $args); }
+    catch (Exception $e) { eecho($cmd . ": " . $e->getMessage()); return 127; }
+}
+
+# jak inherit, ale w katalogu $dir (wraca do poprzedniego)
+func inDir($dir, $cmd, $args = []) {
+    $old = Os.cwd();
+    Os.chdir($dir);
+    $code = 1;
+    try { $code = inherit($cmd, $args); }
+    finally { Os.chdir($old); }
+    return $code;
+}
+
+func shell($line) { return run("/bin/sh", ["-c", $line]); }
+
+# ───────────────── pliki ─────────────────
+func ensureDir($p) {
+    if (!Os.isDir($p)) { Os.mkdir($p); }
+    return $p;
+}
+
+func writeIfChanged($p, $text) {
+    if (Os.isFile($p) && Os.readFile($p) === $text) { return false; }
+    ensureDir(Path.dirname($p));
+    Os.writeFile($p, $text);
+    return true;
+}
+
+func copyDir($from, $to) {
+    ensureDir($to);
+    $r = run("cp", ["-a", $from . "/.", $to]);
+    if ($r["status"] !== 0) { throw new Exception("cp -a " . $from . " nie powiodło się: " . trim($r["stderr"])); }
+    return $to;
+}
+
+# usuwa link symboliczny albo plik/katalog (bez błędu, gdy go nie ma)
+func forceRemove($p) {
+    if (Os.stat($p) === null && !Os.exists($p)) { return null; }
+    run("rm", ["-rf", $p]);
+    return null;
+}
+
+func linkTo($target, $link) {
+    ensureDir(Path.dirname($link));
+    forceRemove($link);
+    Os.symlink($target, $link);
+    return $link;
+}
+
+# suma SHA-256 całego drzewa plików (bez .git): niezależna od kolejności i czasów modyfikacji
+func sha256Dir($dir) {
+    $line = "cd " . sq($dir) . " && find . -type f -not -path './.git/*' | LC_ALL=C sort | xargs -d '\\n' -r sha256sum | sha256sum | cut -d' ' -f1";
+    $r = shell($line);
+    if ($r["status"] !== 0) { throw new Exception("sha256sum niedostępne: " . trim($r["stderr"])); }
+    return trim($r["stdout"]);
+}
+
+func sha256Text($text) {
+    $tmp = Os.mkdtemp("nula-");
+    Os.writeFile($tmp . "/t", $text);
+    $r = shell("sha256sum " . sq($tmp . "/t") . " | cut -d' ' -f1");
+    Os.removeAll($tmp);
+    return trim($r["stdout"]);
+}
+
+# true, gdy plik jest starszy niż $min minut (albo go nie ma)
+func olderThanMin($file, $min) {
+    if (!Os.isFile($file)) { return true; }
+    $r = run("find", [$file, "-mmin", "+" . $min]);
+    return $r["status"] === 0 && trim($r["stdout"]) !== "";
+}
+
+func nowIso() { return capture("date", ["-u", "+%Y-%m-%dT%H:%M:%SZ"]) ?? ""; }
+
+# ścieżka $to względem katalogu $from (oba absolutne): "../../x/y"
+func relPath($from, $to) {
+    $a = [];
+    foreach (split($from, "/") as $x) { if ($x !== "") { $a[] = $x; } }
+    $b = [];
+    foreach (split($to, "/") as $x) { if ($x !== "") { $b[] = $x; } }
+    $i = 0;
+    while ($i < count($a) && $i < count($b) && $a[$i] === $b[$i]) { $i++; }
+    $out = [];
+    for ($j = $i; $j < count($a); $j++) { $out[] = ".."; }
+    for ($j = $i; $j < count($b); $j++) { $out[] = $b[$j]; }
+    return count($out) === 0 ? "." : join($out, "/");
+}
