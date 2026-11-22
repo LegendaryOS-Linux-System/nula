@@ -1,0 +1,115 @@
+namespace Tools;
+
+import Std.Os;
+import Std.Path;
+import Workspace.Util;
+import Workspace.Ui;
+
+##
+ * Tools — lokalizacja zewnętrznych narzędzi, z którymi nula się łączy:
+ *   z#    wrapper Z# (build/run/check/test nad zsc, zsi, zst, zzc)   ← programy Z#
+ *   h#    kompilator H#                                              ← programy H#
+ *   hlpp  Hacker Lang++ (hl: zwykły Hacker Lang)                     ← skrypty z source-code/
+ *   git, curl — pobieranie pakietów (Std.Net w Z# nie ma TLS)
+ * Kolejność szukania: zmienna NULA_<NAZWA> → (h#: BIT_HSHARP) → build/cache/env → PATH.
+##
+
+func envName($tool) {
+    if ($tool === "z#") { return "NULA_ZSHARP"; }
+    if ($tool === "h#") { return "NULA_HSHARP"; }
+    return "NULA_" . upper($tool);
+}
+
+func altNames($tool) {
+    if ($tool === "h#") { return ["h#", "hsharp"]; }
+    if ($tool === "z#") { return ["z#", "zsharp"]; }
+    return [$tool];
+}
+
+# ścieżka do narzędzia albo null; $root — katalog projektu (dla build/cache/env), może być null
+func find($tool, $root = null) {
+    $e = Os.env(envName($tool), "");
+    if ($e !== "") { return $e; }
+    if ($tool === "h#") {
+        $b = Os.env("BIT_HSHARP", "");
+        if ($b !== "") { return $b; }
+    }
+    if ($root !== null) {
+        $dir = $root . "/build/cache/env";
+        if (Os.isDir($dir)) {
+            foreach (Os.list($dir) as $d) {
+                foreach (altNames($tool) as $n) {
+                    $cand = $dir . "/" . $d . "/" . $n;
+                    if (Os.isFile($cand)) { return $cand; }
+                }
+            }
+        }
+    }
+    foreach (altNames($tool) as $n) {
+        $w = Os.which($n);
+        if ($w !== null && $w !== "") { return $w; }
+    }
+    return null;
+}
+
+# jak find, ale z czytelnym błędem
+func need($tool, $root = null) {
+    $p = find($tool, $root);
+    if ($p === null) {
+        throw new Exception("nie znaleziono narzędzia `" . $tool . "` (ustaw " . envName($tool) . " albo dodaj do PATH; zob. `nula doctor`)");
+    }
+    return $p;
+}
+
+func version($path) {
+    if ($path === null) { return "?"; }
+    $r = Util.run($path, ["--version"]);
+    $o = trim($r["stdout"]);
+    if ($o === "") { $o = trim($r["stderr"]); }
+    $nl = index_of($o, "\n");
+    if ($nl >= 0) { $o = substr($o, 0, $nl); }
+    return $o === "" ? "?" : $o;
+}
+
+# najniższa wersja H# z [toolchain] / [edition]; pobiera h# z GitHub, gdy brak (jak bit)
+func ensureHsharp($root, $want) {
+    $have = find("h#", $root);
+    if ($have !== null) { return $have; }
+    if ($want === null || $want === "") { return null; }
+    if (Os.env("NULA_OFFLINE", "") === "1") { throw new Exception("brak h# i tryb offline"); }
+    $base = Os.env("NULA_HSHARP_RELEASES", "https://github.com/HackerOS-Linux-System/H-Sharp/releases/download");
+    $dir = $root . "/build/cache/env/hsharp-" . $want;
+    Util.ensureDir($dir);
+    Ui.step("Pobieranie", "h# " . $want . " (" . $base . "/v" . $want . "/hsharp)");
+    $r = Util.run("curl", ["-fL", "--retry", "3", "-o", $dir . "/h#", $base . "/v" . $want . "/hsharp"]);
+    if ($r["status"] !== 0) { throw new Exception("nie udało się pobrać h# " . $want . ": " . trim($r["stderr"])); }
+    Os.chmod($dir . "/h#", 493);
+    return $dir . "/h#";
+}
+
+func doctor($root = null) {
+    echo Ui.bold("nula doctor") . " (" . Os.platform() . "/" . Os.arch() . ")";
+    $missing = 0;
+    $rows = [
+        ["z#", "programy Z# (mod/)"],
+        ["h#", "programy H# (src/)"],
+        ["hlpp", "skrypty Hacker Lang++ (source-code/)"],
+        ["hl", "skrypty Hacker Lang (source-code/)"],
+        ["git", "pobieranie pakietów"],
+        ["curl", "indeks pakietów, narzędzia"]
+    ];
+    foreach ($rows as $r) {
+        $p = find($r[0], $root);
+        $optional = $r[0] === "hl";
+        $state = $p === null ? ($optional ? Ui.dim("brak (opcjonalne)") : Ui.red("BRAK")) : Ui.green("OK") . "  " . $p . "  " . Ui.dim(version($p));
+        echo pad_right($r[0], 8) . " " . pad_right($r[1], 40) . " " . $state;
+        if ($p === null && !$optional) { $missing++; }
+    }
+    foreach (["sha256sum", "cp", "find", "xargs"] as $t) {
+        $p = Os.which($t);
+        echo pad_right($t, 8) . " " . pad_right("narzędzia systemowe", 40) . " " . ($p === null ? Ui.red("BRAK") : Ui.green("OK") . "  " . $p);
+        if ($p === null) { $missing++; }
+    }
+    echo pad_right("store", 8) . " " . Os.env("NULA_HOME", Os.home() . "/.hackeros/nula");
+    return $missing === 0 ? 0 : 1;
+}
