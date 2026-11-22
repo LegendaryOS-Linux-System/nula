@@ -1,0 +1,87 @@
+use <mode:website>
+use <site:lang=pl>
+
+!!! Strona nuli. Budowanie:  hackerc website cmd/main.hcs -o dist   (albo: bit build)
+!!! Routing po #hash — działa z file:// i z GitHub Pages bez konfiguracji.
+
+head {
+    <meta name="description" content="nula — menedżer pakietów i łącznik H# i Z#, napisany w Z#">
+    <meta name="theme-color" content="#0b0714">
+}
+
+style {
+    :root { --bg: #0b0714; --fg: #e8e4f0; --dim: #9a93ab; --akcent: #7cf0c9; --karta: #151025; }
+    body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.6 system-ui, sans-serif; }
+    #app { max-width: 880px; margin: 0 auto; padding: 1rem 1.25rem 4rem; }
+    nav { display: flex; flex-wrap: wrap; gap: 1rem; padding: .75rem 0; border-bottom: 1px solid #2a2140; }
+    .nav-link { color: var(--dim); text-decoration: none; }
+    .nav-link.active, .nav-link:hover { color: var(--akcent); }
+    h1 { font-size: 2.4rem; margin: 1.5rem 0 .25rem; }
+    h2 { margin-top: 2rem; color: var(--akcent); }
+    pre { background: var(--karta); padding: 1rem; border-radius: .5rem; overflow-x: auto; white-space: pre; }
+    .lead { color: var(--dim); font-size: 1.15rem; }
+    .karta { background: var(--karta); border-radius: .5rem; padding: .75rem 1rem; margin: .75rem 0; }
+    @media (max-width: 600px) { h1 { font-size: 1.8rem; } }
+}
+
+fun kod(rodzic, tekst: Str) [
+    child(rodzic, "pre", tekst)
+]
+
+fun karta(rodzic, tytul: Str, tresc: Str) [
+    let k = child(rodzic, "div", "")
+    dom_class(k, "karta")
+    child(k, "strong", tytul)
+    child(k, "p", tresc)
+]
+
+fun strona_start() [
+    let o = route_outlet()
+    child(o, "h1", "nula")
+    let lead = child(o, "p", "Menedżer pakietów i łącznik między H# a Z# — napisany w 100% w Z#.")
+    dom_class(lead, "lead")
+    karta(o, "Zależności z kodu", "Nie deklarujesz bibliotek w nula.hk. nula czyta importy z src/, mod/ i source-code/, pobiera pakiety i zapisuje nula.lock.")
+    karta(o, "Jedno narzędzie w dwóch językach", "Kod H# w src/, kod Z# w mod/ — razem albo osobno. Funkcje oznaczone nula:export widać po drugiej stronie mostka.")
+    karta(o, "Właściwy kompilator do właściwego kodu", "z# dla Z#, h# dla H#, hlpp dla skryptów Hacker Lang++ — nula tylko to spina.")
+    kod(o, "nula new narzedzie --lang h#,z#\ncd narzedzie\nnula build --release\nnula run")
+]
+
+fun strona_uklad() [
+    let o = route_outlet()
+    child(o, "h1", "Układ projektu")
+    kod(o, "src/           kod H#\nmod/           kod Z#\nsource-code/   opcjonalnie: Hacker Lang / Hacker Lang++\nbuild/         binarka + libs/ (biblioteki) + cache/\nnula.hk        manifest\nnula.lock      zablokowane wersje (commituj)")
+    child(o, "h2", "nula.hk")
+    kod(o, "[package]\n-> name => narzedzie\n-> version => 0.1.0\n\n[build]\n-> main => z#\n\n! opcjonalnie: zawężenie wersji, nie deklaracja\n[pins]\n-> colors => ^1.2")
+    child(o, "p", "Format .hk: komentarz to cała linia od !, wpisy -> klucz => wartość, zagnieżdżenia -->, tablice [a, b].")
+]
+
+fun strona_most() [
+    let o = route_outlet()
+    child(o, "h1", "Most H# ↔ Z#")
+    child(o, "p", "Funkcję oznaczasz komentarzem nad nią. Komentarz nie zmienia składni żadnego języka.")
+    kod(o, ";; H#  (src/lib.h#)\n;; nula:export\npub fn add(a: int, b: int) -> int is\n    return a + b\nend")
+    kod(o, "# Z#  (mod/main.zsharp)\nimport Workspace.HBridge;\necho HBridge.add(2, 3);")
+    karta(o, "static", "Same int / float / bool: ABI C, h# --emit lib i extern statyczny w Z#. Zero kosztu wywołania.")
+    karta(o, "process", "Gdy są stringi, i zawsze dla Z# → H#: wygenerowany dispatcher (hside / zside), argumenty w argv, wynik na stdout.")
+]
+
+fun strona_polecenia() [
+    let o = route_outlet()
+    child(o, "h1", "Polecenia")
+    kod(o, "nula new / init        nowy projekt\nnula install          skan → pobranie → nula.lock\nnula update [nazwa]   nowe wersje w zakresie\nnula outdated         co jest nowsze\nnula tree / deps      drzewo / co znalazł skaner\nnula build [--release]\nnula run [-- args]\nnula check / test / clean\nnula bridge [--check] IDL mostka\nnula script plik.hlpp skrypt Hacker Lang++\nnula doctor           diagnostyka narzędzi")
+]
+
+fun main() [
+    page_title("nula — pakiety i most H# ↔ Z#")
+    let nav = child(app_root(), "nav", "")
+    nav_child(nav, "/", "Start")
+    nav_child(nav, "/uklad", "Układ")
+    nav_child(nav, "/most", "Most H# ↔ Z#")
+    nav_child(nav, "/polecenia", "Polecenia")
+    let tresc = child(app_root(), "div", "")
+    dom_attr(tresc, "id", "route-outlet")
+    route("/", strona_start)
+    route("/uklad", strona_uklad)
+    route("/most", strona_most)
+    route("/polecenia", strona_polecenia)
+]
