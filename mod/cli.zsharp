@@ -1,0 +1,51 @@
+namespace Cli;
+
+##
+ * Cli — parser argumentów: `nula [flagi globalne] <polecenie> [argumenty] [flagi] [-- reszta]`.
+ * Flagi z wartością podaje się w $valued (np. ["--lang", "-o"]); `--flaga=wartość` działa zawsze.
+ * Wynik: ["cmd" => tekst, "pos" => [...], "flags" => [nazwa => wartość|true], "rest" => [...]]
+##
+
+func parse($argv, $valued = []) {
+    $r = ["cmd" => "", "pos" => [], "flags" => [], "rest" => []];
+    $n = count($argv);
+    for ($i = 0; $i < $n; $i++) {
+        $a = $argv[$i];
+        if ($a === "--") {
+            $r["rest"] = array_slice($argv, $i + 1);
+            break;
+        }
+        if (starts_with($a, "--") && index_of($a, "=") > 0) {
+            $eq = index_of($a, "=");
+            $r["flags"][substr($a, 0, $eq)] = substr($a, $eq + 1);
+            continue;
+        }
+        if (starts_with($a, "-") && strlen($a) > 1) {
+            if (in_array($a, $valued) && $i + 1 < $n) {
+                $r["flags"][$a] = $argv[$i + 1];
+                $i++;
+            } else {
+                $r["flags"][$a] = true;
+            }
+            continue;
+        }
+        if ($r["cmd"] === "") { $r["cmd"] = $a; } else { $r["pos"][] = $a; }
+    }
+    return $r;
+}
+
+func has($p, $name, $short = "") {
+    return has_key($p["flags"], $name) || ($short !== "" && has_key($p["flags"], $short));
+}
+
+func value($p, $name, $default = null, $short = "") {
+    if (has_key($p["flags"], $name)) {
+        $v = $p["flags"][$name];
+        return $v === true ? $default : $v;
+    }
+    if ($short !== "" && has_key($p["flags"], $short)) {
+        $v = $p["flags"][$short];
+        return $v === true ? $default : $v;
+    }
+    return $default;
+}
