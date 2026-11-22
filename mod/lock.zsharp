@@ -1,0 +1,42 @@
+namespace Lock;
+
+import Std.Os;
+import Std.Json;
+import Workspace.Util;
+
+##
+ * Lock — nula.lock: JSON Lines (jeden pakiet na linię, posortowane po nazwie), linie od `!` to komentarze.
+ * Pola: name, version, commit, source, rev, dir, req, checksum, langs, deps, path (tylko dla zależności `path`).
+ * Plik jest deterministyczny — nadaje się do commitowania i do `nula install --locked` w CI.
+##
+
+func read($path) {
+    $out = [];
+    if (!Os.isFile($path)) { return $out; }
+    $lines = Util.lines(Os.readFile($path));
+    for ($i = 0; $i < count($lines); $i++) {
+        $l = trim($lines[$i]);
+        if ($l === "" || starts_with($l, "!")) { continue; }
+        $e = null;
+        try { $e = Json.decode($l); }
+        catch (Exception $ex) { throw new Exception("nula.lock:" . ($i + 1) . ": " . $ex->getMessage()); }
+        if (!is_array($e) || !has_key($e, "name")) { throw new Exception("nula.lock:" . ($i + 1) . ": brak pola `name`"); }
+        $out[$e["name"]] = $e;
+    }
+    return $out;
+}
+
+func orderedEntry($e) {
+    $o = [];
+    foreach (["name", "version", "commit", "source", "rev", "dir", "req", "checksum", "langs", "deps", "path"] as $k) {
+        if (has_key($e, $k)) { $o[$k] = $e[$k]; }
+    }
+    return $o;
+}
+
+func write($path, $entries) {
+    $names = Util.sortStrings(keys($entries));
+    $out = ["! nula.lock — generowany przez nulę, nie edytuj ręcznie (commituj ten plik)"];
+    foreach ($names as $n) { $out[] = Json.encode(orderedEntry($entries[$n])); }
+    return Util.writeIfChanged($path, join($out, "\n") . "\n");
+}
