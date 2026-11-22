@@ -1,0 +1,50 @@
+namespace Ui;
+
+import Std.Os;
+
+##
+ * Ui — komunikaty w stylu cargo. Stan (verbose/quiet) idzie przez zmienne środowiska,
+ * więc nie trzeba przekazywać kontekstu przez każdą funkcję:
+ *   NULA_VERBOSE=1, NULA_QUIET=1, NO_COLOR, NULA_COLOR=always|never
+##
+
+func useColor() {
+    if (Os.env("NO_COLOR", "") !== "") { return false; }
+    $c = Os.env("NULA_COLOR", "");
+    if ($c === "never") { return false; }
+    if ($c === "always") { return true; }
+    return Os.env("TERM", "dumb") !== "dumb";
+}
+
+func paint($code, $text) {
+    if (!useColor()) { return $text; }
+    return chr(27) . "[" . $code . "m" . $text . chr(27) . "[0m";
+}
+
+func bold($t) { return paint("1", $t); }
+func dim($t) { return paint("2", $t); }
+func red($t) { return paint("1;31", $t); }
+func green($t) { return paint("1;32", $t); }
+func yellow($t) { return paint("1;33", $t); }
+func cyan($t) { return paint("1;36", $t); }
+
+func quiet() { return Os.env("NULA_QUIET", "") === "1"; }
+func isVerbose() { return Os.env("NULA_VERBOSE", "") === "1"; }
+
+# `   Etykieta  tekst` — etykieta wyrównana do prawej (12 znaków)
+func step($label, $msg) {
+    if (quiet()) { return null; }
+    echo green(pad_left($label, 12)) . " " . $msg;
+    return null;
+}
+
+func info($msg) { if (!quiet()) { echo $msg; } return null; }
+func note($msg) { if (!quiet()) { echo cyan(pad_left("uwaga", 12)) . " " . $msg; } return null; }
+func warn($msg) { eecho(yellow(pad_left("ostrzeżenie", 12)) . " " . $msg); return null; }
+func error($msg) { eecho(red(pad_left("błąd", 12)) . " " . $msg); return null; }
+func verbose($msg) { if (isVerbose()) { eecho(dim("  · " . $msg)); } return null; }
+
+func die($msg) {
+    error($msg);
+    Os.exit(1);
+}
