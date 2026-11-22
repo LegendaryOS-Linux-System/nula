@@ -1,0 +1,202 @@
+namespace Build;
+
+import Std.Os;
+import Std.Path;
+import Std.Toml;
+import Workspace.Util;
+import Workspace.Ui;
+import Workspace.Hk;
+import Workspace.Tools;
+import Workspace.Project;
+import Workspace.Scan;
+import Workspace.Resolve;
+import Workspace.Bridge;
+
+##
+ * Build — jedno polecenie, trzy toolchainy:
+ *   H#    →  h# compile            (src/)
+ *   Z#    →  z# build              (mod/, przez wygenerowany build/cache/z/Z#.toml — wrapper z#, nie zsc wprost)
+ *   HL++  →  hlpp check            (source-code/; skrypty nie wchodzą do binarki)
+ * Kolejność: zależności → most → część „boczna” → część z `main`. Wynik: build/<nazwa>, build/libs/, build/cache/.
+##
+
+func release($m, $opts) { return $opts["release"] !== null ? $opts["release"] : $m["profile"] === "release"; }
+
+# ───────────────── Z#.toml generowany z nula.hk + kodu ─────────────────
+func zMembers($root, $m, $info) {
+    $members = [];
+    $dir = $root . "/" . $m["mod"];
+    foreach (Project.files($dir, [".zsharp", ".zs"]) as $f) {
+        $ns = Bridge.nsOf(Util.lines(Os.readFile($f)));
+        $key = $ns !== "" ? $ns : Bridge.stemOf($f);
+        if (has_key($members, $key)) { throw new Exception("dwa pliki Z# dają ten sam człon workspace `" . $key . "` (" . $members[$key] . ", " . $f . ") — zmień `namespace` albo nazwę pliku"); }
+        $members[$key] = $f;
+    }
+    if ($info !== null) { $members["HBridge"] = $info["facade"]; }
+    return $members;
+}
+
+# zapisuje <katalog>/Z#.toml; $entry — absolutna ścieżka wejścia; $kind — bin|lib
+func writeZManifest($root, $m, $dir, $entry, $kind, $res, $info) {
+    Util.ensureDir($dir);
+    $members = [];
+    foreach (zMembers($root, $m, $info) as $k => $f) { $members[$k] = Util.relPath($dir, $f); }
+    $deps = [];
+    if ($res !== null) {
+        foreach ($res["entries"] as $n => $e) {
+            if (in_array("z#", $e["langs"])) { $deps[$n] = ["path" => Util.relPath($dir, Project.libsDir($m) . "/" . $n . "/current")]; }
+        }
+    }
+    $doc = ["package" => ["name" => $m["name"], "version" => $m["version"], "kind" => $kind, "entry" => Util.relPath($dir, $entry)],
+        "workspace" => ["members" => $members]];
+    if (count($deps) > 0) { $doc["dependencies"] = $deps; }
+    if ($info !== null && $info["htransport"] === "static") {
+        $doc["extern"] = ["hside" => ["kind" => "static", "path" => Util.relPath($dir, Project.libsDir($m) . "/libhside.a")]];
+    }
+    Util.writeIfChanged($dir . "/Z#.toml", "# GENEROWANE przez nulę z nula.hk i kodu — nie edytuj (build/ jest w .gitignore)\n" . Toml.encode($doc));
+    return $dir . "/Z#.toml";
+}
+
+func zBuild($root, $m, $dir, $out, $opts, $res, $info, $entry) {
+    $z = Tools.need("z#", $root);
+    writeZManifest($root, $m, $dir, $entry, "bin", $res, $info);
+    Os.setEnv("ZS_WORKSPACE", $dir);
+    $args = ["build"];
+    if (release($m, $opts)) { $args[] = "--release"; }
+    $args[] = "--backend";
+    $args[] = $m["backend"];
+    $args[] = "-o";
+    $args[] = $out;
+    Ui.step("Kompilacja", "Z# → " . Path.basename($out));
+    $code = Util.inDir($dir, $z, $args);
+    if ($code !== 0) { throw new Exception("z# build zakończył się kodem " . $code); }
+    return $out;
+}
+
+# ───────────────── H# ─────────────────
+func hEntry($root, $m, $preferLib) {
+    $d = $root . "/" . $m["src"];
+    $order = $preferLib ? ["lib.h#", "main.h#"] : ["main.h#", "lib.h#"];
+    foreach ($order as $f) { if (Os.isFile($d . "/" . $f)) { return $d . "/" . $f; } }
+    $all = Project.files($d, [".h#"]);
+    return count($all) > 0 ? $all[0] : null;
+}
+
+func hBuild($root, $m, $entry, $out, $emit, $opts) {
+    $h = Tools.ensureHsharp($root, $m["toolchain"]);
+    if ($h === null) { throw new Exception("nie znaleziono narzędzia `h#` (ustaw NULA_HSHARP albo [toolchain] -> h# => wersja, zob. `nula doctor`)"); }
+    Util.ensureDir(Path.dirname($out));
+    $args = ["compile", $entry];
+    if (release($m, $opts)) { $args[] = "--release"; }
+    if ($emit !== "") { $args[] = "--emit"; $args[] = $emit; }
+    $args[] = "-o";
+    $args[] = $out;
+    Ui.step("Kompilacja", "H# → " . Path.basename($out) . ($emit !== "" ? " (" . $emit . ")" : ""));
+    $code = Util.inDir($root, $h, $args);
+    if ($code !== 0) { throw new Exception("h# compile zakończył się kodem " . $code); }
+    return $out;
+}
+
+# ───────────────── hooki i skrypty ─────────────────
+func hook($root, $m, $name) {
+    if (!has_key($m["hooks"], $name)) { return null; }
+    Ui.step("Hook", $name);
+    $code = Util.inDir($root, "/bin/sh", ["-c", $m["hooks"][$name]]);
+    if ($code !== 0) { throw new Exception("hook `" . $name . "` zakończył się kodem " . $code); }
+    return null;
+}
+
+func checkScripts($root, $src) {
+    foreach (["hlpp", "hl"] as $l) {
+        if (count($src[$l]) === 0) { continue; }
+        $t = Tools.find($l, $root);
+        if ($t === null) { Ui.warn("brak `" . $l . "` — pomijam sprawdzanie " . count($src[$l]) . " skryptów z source-code/"); continue; }
+        foreach ($src[$l] as $f) {
+            $code = Util.inherit($t, ["check", $f]);
+            if ($code !== 0) { throw new Exception($l . " check: " . $f . " (kod " . $code . ")"); }
+        }
+        Ui.step("Sprawdzono", count($src[$l]) . " skryptów " . ($l === "hlpp" ? "Hacker Lang++" : "Hacker Lang"));
+    }
+    return null;
+}
+
+# środowisko dla narzędzi: BIT_HOME → build/libs (kompilator H# i hlpp widzą pakiety nuli), NULA_LIBS dla mostka
+func setEnv($m) {
+    Os.setEnv("BIT_HOME", Project.libsDir($m));
+    Os.setEnv("NULA_LIBS", Project.libsDir($m));
+    return null;
+}
+
+# ───────────────── pipeline ─────────────────
+##
+ * $opts: ["release" => bool|null, "deps" => bool, "locked" => bool, "offline" => bool, "force" => bool, "check" => bool]
+ * Zwraca ["binary" => ścieżka|null, "owner" => "h#"|"z#"|"", "res" => wynik Resolve|null]
+##
+func run($root, $m, $opts) {
+    $src = Project.sources($m);
+    $langs = Project.languages($m, $src);
+    if (count($langs) === 0) { throw new Exception("brak kodu: dodaj pliki do " . $m["src"] . "/ (H#), " . $m["mod"] . "/ (Z#) albo " . $m["scripts"] . "/ (Hacker Lang++)"); }
+    $scope = Project.scopeNote($langs);
+    if ($scope !== null && !$opts["force"]) { throw new Exception($scope); }
+
+    $res = null;
+    if ($opts["deps"]) {
+        $ropts = ["locked" => $opts["locked"], "offline" => $opts["offline"], "update" => [], "dry" => false];
+        $res = Resolve.all($root, $m, $ropts);
+        Resolve.commit($root, $m, $res, $ropts);
+        foreach ($res["external"] as $x) { Ui.note("zależność zewnętrzna `" . $x["name"] . "` (" . (has_key($x, "note") ? $x["note"] : "?") . ") — nula jej nie instaluje"); }
+    }
+    Util.ensureDir(Project.libsDir($m));
+    setEnv($m);
+    hook($root, $m, "pre-build");
+
+    $owner = Project.owner($m, $langs);
+    $both = in_array("h#", $langs) && in_array("z#", $langs);
+    $out = Project.buildDir($m) . "/" . $m["name"];
+    $libs = Project.libsDir($m);
+    $zdir = Project.cacheDir($m) . "/z";
+    $info = null;
+    if ($both) {
+        $info = Bridge.generate($root, $m, $src);
+        $d = Bridge.describe($info);
+        if (count($d) === 0) { Ui.note("H# i Z# bez eksportów mostka (`;; nula:export` / `# nula:export`) — części są niezależne"); }
+        foreach ($d as $line) { Ui.step("Most", $line); }
+    }
+
+    $binary = null;
+    if ($both && $info !== null && (count($info["h"]) > 0 || count($info["z"]) > 0)) {
+        # część boczna najpierw
+        if (count($info["h"]) > 0) {
+            if ($info["htransport"] === "static") { hBuild($root, $m, hEntry($root, $m, true), $libs . "/libhside.a", "lib", $opts); }
+            else { hBuild($root, $m, $info["hsideMain"], $libs . "/hside", "", $opts); }
+        }
+        if (count($info["z"]) > 0) {
+            zBuild($root, $m, Project.cacheDir($m) . "/zside", $libs . "/zside", $opts, $res, $info, Bridge.bridgeDir($m) . "/zside_main.zsharp");
+        }
+        if ($owner === "h#") { $binary = hBuild($root, $m, hEntry($root, $m, false), $out, "", $opts); }
+        else { $binary = zBuild($root, $m, $zdir, $out, $opts, $res, $info, Project.zMain($m)); }
+    } else {
+        if (in_array("h#", $langs)) {
+            $isOwner = $owner === "h#" || !in_array("z#", $langs);
+            if (Project.hasMain($m, "h#")) { $binary = hBuild($root, $m, hEntry($root, $m, false), $isOwner ? $out : $out . "-h", "", $opts); }
+            else { hBuild($root, $m, hEntry($root, $m, true), $libs . "/lib" . $m["name"] . ".a", "lib", $opts); }
+        }
+        if (in_array("z#", $langs)) {
+            if (Project.hasMain($m, "z#")) {
+                $isOwner = $owner === "z#";
+                $zb = zBuild($root, $m, $zdir, $isOwner ? $out : $out . "-z", $opts, $res, $info, Project.zMain($m));
+                if ($isOwner) { $binary = $zb; }
+            } else {
+                $first = $src["z#"][0];
+                $mf = writeZManifest($root, $m, $zdir, $first, "lib", $res, $info);
+                Os.setEnv("ZS_WORKSPACE", $zdir);
+                $code = Util.inDir($zdir, Tools.need("z#", $root), ["check"]);
+                if ($code !== 0) { throw new Exception("z# check zakończył się kodem " . $code); }
+                Ui.step("Sprawdzono", "biblioteka Z# (brak mod/main.zsharp)");
+            }
+        }
+    }
+    checkScripts($root, $src);
+    hook($root, $m, "post-build");
+    return ["binary" => $binary, "owner" => $owner, "res" => $res];
+}
