@@ -1,0 +1,210 @@
+namespace Project;
+
+import Std.Os;
+import Std.Path;
+import Workspace.Util;
+import Workspace.Hk;
+import Workspace.Ui;
+
+##
+ * Project — nula.hk, układ katalogów i wykrywanie języków.
+ *
+ *   src/          H#            (*.h#)
+ *   mod/          Z#            (*.zsharp, *.zs)
+ *   source-code/  Hacker Lang / Hacker Lang++ — opcjonalne (*.hl, *.hl++, *.hlpp)
+ *   build/        <nazwa> (binarka), libs/ (biblioteki), cache/ (reszta)
+ *   nula.hk, nula.lock
+ *
+ * nula.hk NIE zawiera [dependencies]: zależności wykrywa skaner (Scan) z importów w kodzie.
+ * Opcjonalna sekcja [pins] tylko zawęża wersje albo wskazuje źródło.
+##
+
+# katalog projektu (zawiera nula.hk) w górę od $start albo null
+func find($start) {
+    $d = Path.absolute($start);
+    while (true) {
+        if (Os.isFile($d . "/nula.hk")) { return $d; }
+        if ($d === "/" || $d === "") { return null; }
+        $d = Path.dirname($d);
+    }
+    return null;
+}
+
+func load($root) {
+    $doc = Hk.parse(Os.readFile($root . "/nula.hk"));
+    $m = [];
+    $m["root"] = $root;
+    $m["doc"] = $doc;
+    $m["name"] = Hk.get($doc, "package", "name", Path.basename($root));
+    $m["version"] = Hk.get($doc, "package", "version", "0.1.0");
+    $m["description"] = Hk.get($doc, "package", "description", "");
+    $m["license"] = Hk.get($doc, "package", "license", "");
+    $m["lang"] = Hk.asList(Hk.get($doc, "package", "lang", []));
+    $m["src"] = Hk.get($doc, "layout", "src", "src");
+    $m["mod"] = Hk.get($doc, "layout", "mod", "mod");
+    $m["scripts"] = Hk.get($doc, "layout", "source-code", "source-code");
+    $m["build"] = Hk.get($doc, "layout", "build", "build");
+    $m["main"] = Hk.get($doc, "build", "main", "auto");          # auto | h# | z#
+    $m["profile"] = Hk.get($doc, "build", "profile", "release"); # release | debug
+    $m["backend"] = Hk.get($doc, "build", "backend", "c");       # backend Z#: c | llvm | gcc
+    $m["transport"] = Hk.get($doc, "bridge", "transport", "auto"); # auto | static | process
+    $m["pins"] = Hk.section($doc, "pins");
+    $m["hooks"] = Hk.section($doc, "hooks");
+    $m["toolchain"] = Hk.get($doc, "toolchain", "h#", Hk.get($doc, "edition", "toolchain", ""));
+    if (!validName($m["name"])) {
+        throw new Exception("nula.hk: [package] name `" . $m["name"] . "` — dozwolone litery, cyfry, `-`, `_`, `.`");
+    }
+    return $m;
+}
+
+func validName($name) {
+    if ($name === "") { return false; }
+    for ($i = 0; $i < strlen($name); $i++) {
+        $c = substr($name, $i, 1);
+        if (!(is_alnum($c) || $c === "-" || $c === "_" || $c === ".")) { return false; }
+    }
+    return true;
+}
+
+func buildDir($m) { return $m["root"] . "/" . $m["build"]; }
+func libsDir($m) { return buildDir($m) . "/libs"; }
+func cacheDir($m) { return buildDir($m) . "/cache"; }
+
+# pliki z katalogu (rekurencyjnie) o danych końcówkach
+func files($dir, $exts) {
+    $out = [];
+    if (!Os.isDir($dir)) { return $out; }
+    foreach (Util.sortStrings(Os.walk($dir)) as $p) {
+        if (!Os.isFile($p)) { continue; }
+        foreach ($exts as $e) {
+            if (ends_with($p, $e)) { $out[] = $p; break; }
+        }
+    }
+    return $out;
+}
+
+# ["h#" => [...], "z#" => [...], "hl" => [...], "hlpp" => [...]]
+func sources($m) {
+    $r = $m["root"];
+    $s = [];
+    $s["h#"] = [];
+    foreach (files($r . "/" . $m["src"], [".h#"]) as $hf) {
+        # plik wygenerowany przez nulę nie jest „własnym” kodem H#
+        if (Path.basename($hf) !== "nula_zbridge.h#") { $s["h#"][] = $hf; }
+    }
+    $s["z#"] = files($r . "/" . $m["mod"], [".zsharp", ".zs"]);
+    $all = files($r . "/" . $m["scripts"], [".hl", ".hl++", ".hlpp"]);
+    $s["hl"] = [];
+    $s["hlpp"] = [];
+    foreach ($all as $f) {
+        if (ends_with($f, ".hl")) { $s["hl"][] = $f; } else { $s["hlpp"][] = $f; }
+    }
+    return $s;
+}
+
+# języki z niepustymi źródłami, w stałej kolejności
+func languages($m, $src = null) {
+    if ($src === null) { $src = sources($m); }
+    $out = [];
+    foreach (["h#", "z#", "hl", "hlpp"] as $l) {
+        if (count($src[$l]) > 0) { $out[] = $l; }
+    }
+    return $out;
+}
+
+func hasMain($m, $lang) {
+    if ($lang === "h#") { return Os.isFile($m["root"] . "/" . $m["src"] . "/main.h#"); }
+    if ($lang === "z#") { return Os.isFile($m["root"] . "/" . $m["mod"] . "/main.zsharp") || Os.isFile($m["root"] . "/" . $m["mod"] . "/main.zs"); }
+    return false;
+}
+
+func zMain($m) {
+    $a = $m["root"] . "/" . $m["mod"] . "/main.zsharp";
+    if (Os.isFile($a)) { return $a; }
+    return $m["root"] . "/" . $m["mod"] . "/main.zs";
+}
+
+# który język jest właścicielem końcowej binarki: "h#" | "z#" | "" (brak kodu kompilowanego)
+func owner($m, $langs) {
+    $h = in_array("h#", $langs);
+    $z = in_array("z#", $langs);
+    if ($m["main"] === "h#" || $m["main"] === "z#") { return $m["main"]; }
+    if ($h && !$z) { return "h#"; }
+    if ($z && !$h) { return "z#"; }
+    if (!$h && !$z) { return ""; }
+    $hm = hasMain($m, "h#");
+    $zm = hasMain($m, "z#");
+    if ($hm && !$zm) { return "h#"; }
+    if ($zm && !$hm) { return "z#"; }
+    if ($hm && $zm) { throw new Exception("oba języki mają main (src/main.h# i mod/main.zsharp) — ustaw [build] -> main => h# albo z#"); }
+    return "z#";
+}
+
+##
+ * Zakres nuli: czysty H# ma już `bit`. nula ma sens, gdy projekt łączy H# z Z# / Hacker Lang(++)
+ * albo gdy to tylko Z# / Hacker Lang(++). Zwraca komunikat dla czystego H# albo null.
+##
+func scopeNote($langs) {
+    if (count($langs) === 1 && $langs[0] === "h#") {
+        return "ten projekt to czysty H# — do niego służy `bit` (Bit.hk). nula jest potrzebna, gdy H# współpracuje z Z# lub Hacker Lang(++). Użyj --force, żeby mimo to kontynuować.";
+    }
+    return null;
+}
+
+# ───────────────── nowy projekt ─────────────────
+func hsharpHello($name) {
+    return "fn main() is\n    write(\"Hello from " . $name . " (H#)!\")\nend\n";
+}
+
+func hsharpLib($name) {
+    return ";; biblioteka H# — wyeksportowane funkcje mostka oznacz komentarzem `;; nula:export`\n;; nula:export\npub fn add(a: int, b: int) -> int is\n    return a + b\nend\n";
+}
+
+func zsharpHello($name) {
+    return "import System;\n\nfunc main(): int {\n    echo \"Hello from " . $name . " (Z#)!\";\n    return 0;\n}\n";
+}
+
+func zsharpLib($name) {
+    return "namespace Lib;\n\n# funkcje widoczne dla H# oznacz komentarzem `# nula:export` (typy parametrów są wtedy wymagane)\n# nula:export\nfunc greet(string \$who): string {\n    return \"Hello, \" . \$who . \"!\";\n}\n";
+}
+
+func hlppHello($name) {
+    return "using <gen 2026>\n~> Hello from " . $name . " (Hacker Lang++)!\n";
+}
+
+func manifestText($name, $langs, $bridge) {
+    $doc = [];
+    $doc["package"] = ["name" => $name, "version" => "0.1.0"];
+    $doc["build"] = ["profile" => "release"];
+    if ($bridge) { $doc["bridge"] = ["transport" => "auto"]; }
+    return "! nula.hk — manifest projektu. Zależności NIE są tu deklarowane: nula wykrywa je w kodzie.\n" .
+        "! [pins] (opcjonalnie) zawęża wersję: `-> colors => ^1.2`, `-> x => git https://github.com/u/x v2`, `-> y => path ../y`\n" .
+        Hk.encode($doc);
+}
+
+func scaffold($dir, $name, $langs, $lib) {
+    if (Os.isFile($dir . "/nula.hk")) { throw new Exception("nula.hk już istnieje w " . $dir); }
+    Util.ensureDir($dir);
+    $both = in_array("h#", $langs) && in_array("z#", $langs);
+    if (in_array("h#", $langs)) {
+        Util.ensureDir($dir . "/src");
+        $asLib = $lib || $both;
+        Util.writeIfChanged($dir . "/src/" . ($asLib ? "lib.h#" : "main.h#"), $asLib ? hsharpLib($name) : hsharpHello($name));
+    }
+    if (in_array("z#", $langs)) {
+        Util.ensureDir($dir . "/mod");
+        if ($both) {
+            Util.writeIfChanged($dir . "/mod/main.zsharp", "import Workspace.HBridge;\n\nfunc main(): int {\n    echo \"2 + 3 = \" . HBridge.add(2, 3);\n    return 0;\n}\n");
+        } else {
+            Util.writeIfChanged($dir . "/mod/" . ($lib ? "lib.zsharp" : "main.zsharp"), $lib ? zsharpLib($name) : zsharpHello($name));
+        }
+    }
+    if (in_array("hlpp", $langs) || in_array("hl", $langs)) {
+        Util.ensureDir($dir . "/source-code");
+        Util.writeIfChanged($dir . "/source-code/main.hlpp", hlppHello($name));
+    }
+    Util.writeIfChanged($dir . "/nula.hk", manifestText($name, $langs, $both));
+    Util.writeIfChanged($dir . "/.gitignore", "build/\nsrc/nula_zbridge.h#\n");
+    Ui.step("Utworzono", "projekt `" . $name . "` w " . $dir . " (" . join($langs, ", ") . ")");
+    return 0;
+}
