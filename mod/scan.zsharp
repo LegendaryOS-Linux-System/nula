@@ -1,0 +1,253 @@
+namespace Scan;
+
+import Std.Os;
+import Std.Path;
+import Workspace.Util;
+import Workspace.Hk;
+import Workspace.Project;
+import Workspace.Semver;
+
+##
+ * Scan — wykrywanie zależności w kodzie źródłowym (nula.hk ich nie deklaruje).
+ *
+ *   H#   (src/)          use "bit -> nazwa" from "x"      →  pakiet `nazwa`
+ *                        use "github.com/u/repo" from ... →  git https://github.com/u/repo
+ *                        use "std -> ..."                 →  wbudowane (pomijane)
+ *                        use "python -> numpy"            →  zewnętrzne (tylko raport)
+ *   Z#   (mod/)          import Pakiet.Cokolwiek;         →  pakiet `Pakiet`, o ile to nie Std / Workspace /
+ *                                                            wbudowany moduł / własny plik, katalog lub namespace
+ *   HL / HL++            # <bit/nazwa[:wersja]>           →  pakiet `nazwa`
+ *   (source-code/)       # <github/u/repo[:wersja]>       →  git https://github.com/u/repo
+ *                        # <main/...>                     →  wbudowane (pomijane)
+ *                        (aliasy: std/→main/, virus/→bit/, community/→github/)
+ *
+ * Rekord zależności: ["name","kind","git","path","rev","req","dir","lang","file","by","pin"]
+ *   kind: registry (szukaj w indeksie) | git (adres znany) | path | external (python/npm — nie instalujemy)
+##
+
+# (moduły nie mają kodu najwyższego poziomu — stałe to funkcje)
+func skipDirs() { return ["build", "cache", "tests", "test", "examples", "example", "docs", "website", "node_modules", "target", "dist"]; }
+func builtinZ() { return ["Std", "Workspace", "System", "Math", "File", "Directory", "Process", "Socket", "Task"]; }
+
+func dep($name, $lang, $file) {
+    return ["name" => $name, "kind" => "registry", "git" => "", "path" => "", "rev" => "", "req" => "", "dir" => "", "lang" => $lang, "file" => $file, "by" => "", "pin" => null];
+}
+
+func langOf($path) {
+    if (ends_with($path, ".h#")) { return "h#"; }
+    if (ends_with($path, ".zsharp") || ends_with($path, ".zs")) { return "z#"; }
+    if (ends_with($path, ".hl++") || ends_with($path, ".hlpp")) { return "hlpp"; }
+    if (ends_with($path, ".hl")) { return "hl"; }
+    return "";
+}
+
+func lastIndex($s, $ch) {
+    $i = strlen($s) - 1;
+    while ($i >= 0 && substr($s, $i, 1) !== $ch) { $i--; }
+    return $i;
+}
+
+func repoName($path) {
+    $p = path_trim($path);
+    $i = lastIndex($p, "/");
+    return $i >= 0 ? substr($p, $i + 1) : $p;
+}
+
+func path_trim($p) {
+    while (ends_with($p, "/")) { $p = substr($p, 0, strlen($p) - 1); }
+    if (ends_with($p, ".git")) { $p = substr($p, 0, strlen($p) - 4); }
+    return $p;
+}
+
+# "github.com/u/repo/sub/dir" → ["https://github.com/u/repo", "sub/dir"]
+func gitFromPath($spec) {
+    $seg = split(path_trim($spec), "/");
+    $hosts = ["github.com", "gitlab.com", "codeberg.org", "bitbucket.org"];
+    if (in_array($seg[0], $hosts) && count($seg) >= 3) {
+        $url = "https://" . $seg[0] . "/" . $seg[1] . "/" . $seg[2];
+        $dir = count($seg) > 3 ? join(array_slice($seg, 3), "/") : "";
+        return [$url, $dir];
+    }
+    return ["https://" . path_trim($spec), ""];
+}
+
+# ───────────────── H# ─────────────────
+func fromHsharpSpec($spec, $file) {
+    $arrow = index_of($spec, " -> ");
+    if ($arrow >= 0) {
+        $ns = trim(substr($spec, 0, $arrow));
+        $nm = trim(substr($spec, $arrow + 4));
+        $sep = index_of($nm, "::");
+        if ($sep > 0) { $nm = substr($nm, 0, $sep); }
+        if ($ns === "std" || $ns === "core" || $nm === "") { return null; }
+        $d = dep($nm, "h#", $file);
+        if ($ns === "python" || $ns === "pypi" || $ns === "npm" || $ns === "jsr" || $ns === "crates") { $d["kind"] = "external"; $d["note"] = $ns; }
+        return $d;
+    }
+    if (starts_with($spec, ".") || starts_with($spec, "/") || $spec === "") { return null; }
+    $first = split($spec, "/")[0];
+    if (index_of($first, ".") > 0) {
+        $g = gitFromPath($spec);
+        $d = dep(repoName($g[0]), "h#", $file);
+        $d["kind"] = "git";
+        $d["git"] = $g[0];
+        $d["dir"] = $g[1];
+        return $d;
+    }
+    return dep($spec, "h#", $file);
+}
+
+func hsharp($text, $file) {
+    $out = [];
+    foreach (Util.lines($text) as $l) {
+        $t = trim($l);
+        if (!starts_with($t, "use \"")) { continue; }
+        $rest = substr($t, 5);
+        $q = index_of($rest, "\"");
+        if ($q < 0) { continue; }
+        $d = fromHsharpSpec(substr($rest, 0, $q), $file);
+        if ($d !== null) { $out[] = $d; }
+    }
+    return $out;
+}
+
+# ───────────────── Z# ─────────────────
+# nazwy „własne” importów: pliki i katalogi z mod/ oraz deklaracje `namespace X.Y;`
+func zLocalRoots($zfiles, $modDir) {
+    $roots = [];
+    foreach ($zfiles as $f) {
+        $rel = starts_with($f, $modDir . "/") ? substr($f, strlen($modDir) + 1) : Path.basename($f);
+        $first = split($rel, "/")[0];
+        $dot = index_of($first, ".");
+        $roots[] = $dot > 0 ? substr($first, 0, $dot) : $first;
+        foreach (Util.lines(Os.readFile($f)) as $l) {
+            $t = trim($l);
+            if (starts_with($t, "namespace ")) {
+                $ns = trim(substr($t, 10));
+                $semi = index_of($ns, ";");
+                if ($semi >= 0) { $ns = substr($ns, 0, $semi); }
+                $roots[] = split(trim($ns), ".")[0];
+            }
+        }
+    }
+    return Util.unique($roots);
+}
+
+func zsharp($text, $file, $local) {
+    $out = [];
+    foreach (Util.lines($text) as $l) {
+        $t = trim($l);
+        if (!starts_with($t, "import ")) { continue; }
+        $spec = trim(substr($t, 7));
+        $semi = index_of($spec, ";");
+        if ($semi >= 0) { $spec = trim(substr($spec, 0, $semi)); }
+        $root = trim(split($spec, ".")[0]);
+        if ($root === "" || in_array($root, builtinZ()) || in_array($root, $local)) { continue; }
+        $out[] = dep($root, "z#", $file);
+    }
+    return $out;
+}
+
+# ───────────────── Hacker Lang / Hacker Lang++ ─────────────────
+func normalizeSpec($raw) {
+    if (starts_with($raw, "std/")) { return "main/" . substr($raw, 4); }
+    if (starts_with($raw, "virus/")) { return "bit/" . substr($raw, 6); }
+    if (starts_with($raw, "community/")) { return "github/" . substr($raw, 10); }
+    return $raw;
+}
+
+func hacker($text, $file, $lang) {
+    $out = [];
+    foreach (Util.lines($text) as $l) {
+        $t = trim($l);
+        if (!starts_with($t, "#")) { continue; }
+        $r = trim(substr($t, 1));
+        if (!starts_with($r, "<")) { continue; }
+        $c = index_of($r, ">");
+        if ($c < 1) { continue; }
+        $spec = normalizeSpec(trim(substr($r, 1, $c - 1)));
+        $ver = "";
+        $col = lastIndex($spec, ":");
+        if ($col >= 0 && index_of(substr($spec, $col + 1), "/") < 0) {
+            $ver = substr($spec, $col + 1);
+            $spec = substr($spec, 0, $col);
+        }
+        $sl = index_of($spec, "/");
+        if ($sl < 0) { continue; }
+        $ns = substr($spec, 0, $sl);
+        $rest = substr($spec, $sl + 1);
+        if ($ns === "bit") {
+            $d = dep($rest, $lang, $file);
+            if ($ver !== "") { if (Semver.valid($ver)) { $d["req"] = $ver; } else { $d["rev"] = $ver; } }
+            $out[] = $d;
+        } else if ($ns === "github") {
+            $d = dep(repoName($rest), $lang, $file);
+            $d["kind"] = "git";
+            $d["git"] = "https://github.com/" . path_trim($rest);
+            $d["rev"] = $ver;
+            $out[] = $d;
+        }
+    }
+    return $out;
+}
+
+# ───────────────── cały projekt ─────────────────
+func project($root, $m) {
+    $src = Project.sources($m);
+    $deps = [];
+    $local = zLocalRoots($src["z#"], $root . "/" . $m["mod"]);
+    foreach ($src["h#"] as $f) { foreach (hsharp(Os.readFile($f), $f) as $d) { $deps[] = $d; } }
+    foreach ($src["z#"] as $f) { foreach (zsharp(Os.readFile($f), $f, $local) as $d) { $deps[] = $d; } }
+    foreach ($src["hl"] as $f) { foreach (hacker(Os.readFile($f), $f, "hl") as $d) { $deps[] = $d; } }
+    foreach ($src["hlpp"] as $f) { foreach (hacker(Os.readFile($f), $f, "hlpp") as $d) { $deps[] = $d; } }
+    return $deps;
+}
+
+# ───────────────── zainstalowany pakiet ─────────────────
+func walkFiltered($dir) {
+    $out = [];
+    foreach (Os.list($dir) as $n) {
+        if (starts_with($n, ".") || in_array($n, skipDirs())) { continue; }
+        $p = $dir . "/" . $n;
+        if (Os.isDir($p)) { foreach (walkFiltered($p) as $q) { $out[] = $q; } }
+        else { $out[] = $p; }
+    }
+    return $out;
+}
+
+# jawne zależności pakietu z jego Bit.hk ([dependencies]) / nula.hk ([pins])
+func explicit($dir, $lang) {
+    $out = [];
+    foreach ([["nula.hk", "pins"], ["Bit.hk", "dependencies"]] as $mf) {
+        $f = $dir . "/" . $mf[0];
+        if (!Os.isFile($f)) { continue; }
+        try {
+            $doc = Hk.parse(Os.readFile($f));
+            foreach (Hk.section($doc, $mf[1]) as $k => $v) {
+                $d = dep($k, $lang, $f);
+                $d["pin"] = $v;
+                $out[] = $d;
+            }
+        } catch (Exception $e) { }
+    }
+    return $out;
+}
+
+# ["deps" => [...], "langs" => [języki obecne w pakiecie]]
+func package($dir, $name) {
+    $files = walkFiltered($dir);
+    $byLang = ["h#" => [], "z#" => [], "hl" => [], "hlpp" => []];
+    foreach ($files as $f) {
+        $l = langOf($f);
+        if ($l !== "") { $byLang[$l][] = $f; }
+    }
+    $deps = explicit($dir, "h#");
+    $local = zLocalRoots($byLang["z#"], $dir);
+    foreach ($byLang["h#"] as $f) { foreach (hsharp(Os.readFile($f), $f) as $d) { $deps[] = $d; } }
+    foreach ($byLang["z#"] as $f) { foreach (zsharp(Os.readFile($f), $f, $local) as $d) { $deps[] = $d; } }
+    foreach ($byLang["hl"] as $f) { foreach (hacker(Os.readFile($f), $f, "hl") as $d) { $deps[] = $d; } }
+    foreach ($byLang["hlpp"] as $f) { foreach (hacker(Os.readFile($f), $f, "hlpp") as $d) { $deps[] = $d; } }
+    $langs = [];
+    foreach (["h#", "z#", "hl", "hlpp"] as $l) { if (count($byLang[$l]) > 0) { $langs[] = $l; } }
+    return ["deps" => $deps, "langs" => $langs];
+}
