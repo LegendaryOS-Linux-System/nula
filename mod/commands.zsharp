@@ -1,0 +1,302 @@
+namespace Commands;
+
+import Std.Os;
+import Std.Path;
+import Workspace.Util;
+import Workspace.Ui;
+import Workspace.Cli;
+import Workspace.Hk;
+import Workspace.Tools;
+import Workspace.Project;
+import Workspace.Scan;
+import Workspace.Registry;
+import Workspace.Fetch;
+import Workspace.Resolve;
+import Workspace.Bridge;
+import Workspace.Build;
+import Workspace.Semver;
+import Workspace.Lock;
+
+##
+ * Commands — implementacje poleceń CLI. Każde: ($p = wynik Cli.parse) → kod wyjścia.
+##
+
+func version() { return "nula 0.1.0"; }
+
+func usage() {
+    echo Ui.bold("nula") . " — menedżer pakietów i łącznik H# ↔ Z# (+ Hacker Lang / Hacker Lang++)";
+    echo "";
+    echo "użycie: nula [-v] [-q] [--offline] [--root KATALOG] <polecenie> [opcje]";
+    echo "";
+    echo "projekt";
+    echo "  new <nazwa> [--lang h#,z#,hlpp] [--lib]   nowy projekt (domyślnie --lang z#)";
+    echo "  init [--lang ...] [--lib]                 projekt w bieżącym katalogu";
+    echo "  build [--release|--debug] [--no-deps]     zależności → most → kompilacja (h#, z#, hlpp)";
+    echo "  run [-- argumenty]                        build + uruchomienie build/<nazwa>";
+    echo "  check                                     tylko składnia/typy (h# check, z# check, hlpp check)";
+    echo "  test                                      tests/*.zsharp (zsi) + h# check";
+    echo "  clean                                     usuwa build/";
+    echo "zależności (wykrywane w kodzie, nula.hk ich nie deklaruje)";
+    echo "  install [--locked]                        skan → pobranie → nula.lock → build/libs";
+    echo "  update [nazwa...]                         ponowne rozwiązanie wersji";
+    echo "  outdated                                  zablokowane vs najnowsze tagi";
+    echo "  tree                                      drzewo zależności";
+    echo "  deps                                      co skaner znalazł w kodzie (i gdzie)";
+    echo "  pin <nazwa> <wartość>                     wpis do [pins] (np. '^1.2', 'git URL rev', 'path ../x')";
+    echo "  search <fraza>                            szukaj w indeksach";
+    echo "most H# ↔ Z#";
+    echo "  bridge [--check]                          IDL eksportów; generuje warstwy; --check: tylko pokaż";
+    echo "inne";
+    echo "  script <plik> [-- argumenty]              uruchom skrypt Hacker Lang / Hacker Lang++";
+    echo "  doctor | version | help";
+    echo "";
+    echo "zmienne: NULA_HOME NULA_INDEX NULA_OFFLINE NULA_ZSHARP NULA_HSHARP NULA_HLPP NO_COLOR";
+    return 0;
+}
+
+# ───────────────── kontekst projektu ─────────────────
+func needProject($p) {
+    $start = Cli.value($p, "--root", Os.cwd());
+    $root = Project.find($start);
+    if ($root === null) { throw new Exception("brak nula.hk w " . $start . " ani wyżej (użyj `nula new` / `nula init`)"); }
+    return [$root, Project.load($root)];
+}
+
+func buildOpts($p) {
+    $rel = null;
+    if (Cli.has($p, "--release")) { $rel = true; }
+    if (Cli.has($p, "--debug")) { $rel = false; }
+    return ["release" => $rel, "deps" => !Cli.has($p, "--no-deps"), "locked" => Cli.has($p, "--locked"),
+        "offline" => Os.env("NULA_OFFLINE", "") === "1", "force" => Cli.has($p, "--force"), "check" => false];
+}
+
+# ───────────────── new / init ─────────────────
+func langsFrom($p) {
+    $raw = Cli.value($p, "--lang", "z#");
+    $out = [];
+    foreach (split($raw, ",") as $l) {
+        $l = trim($l);
+        if ($l === "hl++" || $l === "hacker++") { $l = "hlpp"; }
+        if (!in_array($l, ["h#", "z#", "hl", "hlpp"])) { throw new Exception("nieznany język `" . $l . "` (h#, z#, hl, hlpp)"); }
+        $out[] = $l;
+    }
+    return Util.unique($out);
+}
+
+func cmdNew($p) {
+    if (count($p["pos"]) < 1) { eecho("nula new: podaj nazwę projektu"); return 2; }
+    $name = Path.basename($p["pos"][0]);
+    if (!Project.validName($name)) { eecho("nula new: niepoprawna nazwa `" . $name . "`"); return 2; }
+    return Project.scaffold($p["pos"][0], $name, langsFrom($p), Cli.has($p, "--lib"));
+}
+
+func cmdInit($p) {
+    $cwd = Os.cwd();
+    return Project.scaffold($cwd, Path.basename($cwd), langsFrom($p), Cli.has($p, "--lib"));
+}
+
+# ───────────────── zależności ─────────────────
+func resolveOpts($p, $update) {
+    return ["locked" => Cli.has($p, "--locked"), "offline" => Cli.has($p, "--offline") || Os.env("NULA_OFFLINE", "") === "1", "update" => $update, "dry" => false];
+}
+
+func installNow($root, $m, $opts) {
+    Ui.step("Skanowanie", "importy w " . $m["src"] . "/, " . $m["mod"] . "/, " . $m["scripts"] . "/");
+    $res = Resolve.all($root, $m, $opts);
+    $changed = Resolve.commit($root, $m, $res, $opts);
+    $n = count($res["entries"]);
+    foreach ($res["external"] as $x) { Ui.note("zależność zewnętrzna `" . $x["name"] . "` (" . (has_key($x, "note") ? $x["note"] : "?") . ") — nula jej nie instaluje"); }
+    Ui.step("Gotowe", $n . " pakietów w " . Project.libsDir($m) . ($changed === 1 ? ", zaktualizowano nula.lock" : ", nula.lock bez zmian"));
+    return $res;
+}
+
+func cmdInstall($p) {
+    $pm = needProject($p);
+    installNow($pm[0], $pm[1], resolveOpts($p, []));
+    return 0;
+}
+
+func cmdUpdate($p) {
+    $pm = needProject($p);
+    $names = count($p["pos"]) > 0 ? $p["pos"] : ["*"];
+    installNow($pm[0], $pm[1], resolveOpts($p, $names));
+    return 0;
+}
+
+func cmdTree($p) {
+    $pm = needProject($p);
+    $opts = resolveOpts($p, []);
+    $opts["dry"] = true;
+    $res = Resolve.all($pm[0], $pm[1], $opts);
+    echo Ui.bold($pm[1]["name"] . " " . $pm[1]["version"]);
+    foreach (Resolve.treeLines($res) as $l) { echo $l; }
+    if (count($res["entries"]) === 0) { echo "(brak zależności)"; }
+    return 0;
+}
+
+func cmdDeps($p) {
+    $pm = needProject($p);
+    $found = Scan.project($pm[0], $pm[1]);
+    if (count($found) === 0) { echo "(skaner nie znalazł zależności)"; return 0; }
+    foreach ($found as $d) {
+        $where = starts_with($d["file"], $pm[0] . "/") ? substr($d["file"], strlen($pm[0]) + 1) : $d["file"];
+        echo pad_right($d["name"], 20) . pad_right($d["lang"], 6) . pad_right($d["kind"], 10) . Ui.dim($where);
+    }
+    return 0;
+}
+
+func cmdOutdated($p) {
+    $pm = needProject($p);
+    $lock = Lock.read($pm[0] . "/nula.lock");
+    if (count($lock) === 0) { echo "nula.lock jest pusty — uruchom `nula install`"; return 0; }
+    $old = 0;
+    foreach (Util.sortStrings(keys($lock)) as $n) {
+        $e = $lock[$n];
+        if (starts_with($e["source"], "path:")) { continue; }
+        $latest = Semver.latest(keys(Fetch.tags($e["source"])));
+        $cur = $e["version"] !== "" ? $e["version"] : Util.firstChars($e["commit"], 8);
+        $stale = $latest !== null && $e["version"] !== "" && $latest !== $e["version"];
+        if ($stale) { $old++; }
+        echo pad_right($n, 20) . pad_right($cur, 14) . ($latest === null ? Ui.dim("(brak tagów)") : ($stale ? Ui.yellow($latest) : Ui.green("aktualny"))) ;
+    }
+    return $old === 0 ? 0 : 1;
+}
+
+func cmdPin($p) {
+    if (count($p["pos"]) < 2) { eecho("nula pin <nazwa> <wartość>"); return 2; }
+    $pm = needProject($p);
+    $name = $p["pos"][0];
+    $val = join(array_slice($p["pos"], 1), " ");
+    Registry.applyPin(Scan.dep($name, "", ""), $val);
+    $file = $pm[0] . "/nula.hk";
+    $doc = $pm[1]["doc"];
+    if (!has_key($doc, "pins")) {
+        Os.appendFile($file, "\n[pins]\n-> " . $name . " => " . $val . "\n");
+    } else {
+        $doc["pins"][$name] = $val;
+        Os.writeFile($file, Hk.encode($doc));
+        Ui.note("nula.hk został przepisany — komentarze `!` nie są zachowywane przy zmianie istniejącego [pins]");
+    }
+    Ui.step("Pin", $name . " => " . $val);
+    return 0;
+}
+
+func cmdSearch($p) {
+    if (count($p["pos"]) < 1) { eecho("nula search <fraza>"); return 2; }
+    $m = ["doc" => []];
+    $pr = Project.find(Os.cwd());
+    if ($pr !== null) { $m = Project.load($pr); }
+    $libs = Registry.libraries($m, Os.env("NULA_OFFLINE", "") === "1");
+    $hits = Registry.search($libs, join($p["pos"], " "));
+    foreach ($hits as $e) { echo Ui.bold(pad_right($e["name"], 18)) . (has_key($e, "description") ? $e["description"] : ""); }
+    echo Ui.dim(count($hits) . " z " . count($libs));
+    return count($hits) > 0 ? 0 : 1;
+}
+
+# ───────────────── build / run / check / test / clean ─────────────────
+func cmdBuild($p) {
+    $pm = needProject($p);
+    $r = Build.run($pm[0], $pm[1], buildOpts($p));
+    if ($r["binary"] !== null) { Ui.step("Gotowe", $r["binary"]); } else { Ui.step("Gotowe", "build zakończony"); }
+    return 0;
+}
+
+func cmdRun($p) {
+    $pm = needProject($p);
+    $r = Build.run($pm[0], $pm[1], buildOpts($p));
+    if ($r["binary"] === null) { throw new Exception("projekt nie ma binarki do uruchomienia (sama biblioteka albo same skrypty — użyj `nula script`)"); }
+    Ui.step("Uruchamianie", $r["binary"]);
+    return Util.inherit($r["binary"], $p["rest"]);
+}
+
+func cmdCheck($p) {
+    $pm = needProject($p);
+    $root = $pm[0];
+    $m = $pm[1];
+    Build.setEnv($m);
+    $src = Project.sources($m);
+    $bad = 0;
+    if (count($src["h#"]) > 0) {
+        $h = Tools.need("h#", $root);
+        $code = Util.inDir($root, $h, array_merge_lists(["check"], $src["h#"]));
+        if ($code !== 0) { $bad++; }
+    }
+    if (count($src["z#"]) > 0) {
+        $info = in_array("h#", Project.languages($m, $src)) ? Bridge.generate($root, $m, $src) : null;
+        $dir = Project.cacheDir($m) . "/z";
+        Build.writeZManifest($root, $m, $dir, $src["z#"][0], "lib", null, $info);
+        Os.setEnv("ZS_WORKSPACE", $dir);
+        $code = Util.inDir($dir, Tools.need("z#", $root), ["check"]);
+        if ($code !== 0) { $bad++; }
+    }
+    Build.checkScripts($root, $src);
+    return $bad === 0 ? 0 : 1;
+}
+
+func array_merge_lists($a, $b) {
+    $out = [];
+    foreach ($a as $x) { $out[] = $x; }
+    foreach ($b as $x) { $out[] = $x; }
+    return $out;
+}
+
+func cmdTest($p) {
+    $pm = needProject($p);
+    $root = $pm[0];
+    Build.setEnv($pm[1]);
+    $pass = 0;
+    $failed = 0;
+    $zsi = Tools.find("zsi", $root);
+    foreach (Project.files($root . "/tests", [".zsharp"]) as $f) {
+        if ($zsi === null) { throw new Exception("nie znaleziono `zsi` (potrzebne do testów Z#)"); }
+        $exp = substr($f, 0, strlen($f) - 7) . ".out";
+        $r = Util.run($zsi, [$f]);
+        $ok = $r["status"] === 0;
+        if (Os.isFile($exp)) { $ok = $r["stdout"] === Os.readFile($exp); }
+        if ($ok) { $pass++; Ui.step("ok", Path.basename($f)); } else { $failed++; Ui.error("FAIL " . Path.basename($f) . " (kod " . $r["status"] . ")"); }
+    }
+    echo "nula test: " . $pass . " ok, " . $failed . " błędów";
+    return $failed === 0 ? 0 : 1;
+}
+
+func cmdClean($p) {
+    $pm = needProject($p);
+    $b = Project.buildDir($pm[1]);
+    if (!Os.isDir($b)) { echo "nic do czyszczenia"; return 0; }
+    Os.removeAll($b);
+    Util.forceRemove($pm[0] . "/" . $pm[1]["src"] . "/nula_zbridge.h#");
+    Ui.step("Usunięto", $b);
+    return 0;
+}
+
+# ───────────────── most ─────────────────
+func cmdBridge($p) {
+    $pm = needProject($p);
+    $src = Project.sources($pm[1]);
+    if (Cli.has($p, "--check")) {
+        $ex = Bridge.scan($pm[1], $src);
+        foreach ($ex["h#"] as $f) { echo "H# → Z#  " . $f["module"] . "::" . Bridge.sigText($f); }
+        foreach ($ex["z#"] as $f) { echo "Z# → H#  " . $f["module"] . "." . Bridge.sigText($f); }
+        return 0;
+    }
+    $info = Bridge.generate($pm[0], $pm[1], $src);
+    foreach (Bridge.describe($info) as $l) { echo $l; }
+    Ui.step("Most", "IDL: " . Bridge.bridgeDir($pm[1]) . "/bridge.json");
+    return 0;
+}
+
+# ───────────────── skrypty Hacker Lang(++) ─────────────────
+func cmdScript($p) {
+    if (count($p["pos"]) < 1) { eecho("nula script <plik> [-- argumenty]"); return 2; }
+    $file = $p["pos"][0];
+    $root = Project.find(Os.cwd());
+    if ($root !== null) { Build.setEnv(Project.load($root)); }
+    $tool = (ends_with($file, ".hl")) ? "hl" : "hlpp";
+    $t = Tools.need($tool, $root);
+    return Util.inherit($t, array_merge_lists([$file], $p["rest"]));
+}
+
+func cmdDoctor($p) {
+    $root = Project.find(Os.cwd());
+    return Tools.doctor($root);
+}
