@@ -1,0 +1,404 @@
+namespace Bridge;
+
+import Std.Os;
+import Std.Path;
+import Std.Json;
+import Workspace.Util;
+import Workspace.Ui;
+import Workspace.Project;
+
+##
+ * Bridge — warstwa łącząca H# (src/) i Z# (mod/) w jedno narzędzie.
+ *
+ * Kontrakt: funkcję, która ma być widoczna po drugiej stronie, oznaczasz komentarzem tuż nad nią
+ * (komentarz nie zmienia składni żadnego z języków, więc kompilatory go ignorują):
+ *
+ *   H#   ;; nula:export                           Z#   # nula:export
+ *        pub fn add(a: int, b: int) -> int is          func greet(string $who): string { ... }
+ *
+ * Typy mostka: int, float (H#: f64), bool, string, void. Z# wymaga typów parametrów i `namespace` w pliku.
+ * nula zapisuje IDL (build/cache/bridge/bridge.json) i generuje cienkie warstwy:
+ *
+ *   H# → Z#   Workspace.HBridge   (mod/ widzi `HBridge.add(2, 3)`; plik leży w build/cache/bridge/)
+ *       static   (same int/float/bool) ABI C: h# --emit lib → build/libs/libhside.a, Z# `extern "hside"` +
+ *                [extern.hside] kind = "static" w wygenerowanym Z#.toml — linkowanie statyczne, zero kosztu wywołania
+ *       process  (są stringi)  build/libs/hside, wywoływany jako `hside <fn> <arg>...`, wynik na stdout
+ *   Z# → H#   src/nula_zbridge.h#  (`mod nula_zbridge` w kodzie H#; plik w .gitignore)
+ *       zawsze process: Z# nie emituje jeszcze biblioteki linkowalnej — build/libs/zside z wygenerowanym main
+ *
+ * [bridge] -> transport => auto | static | process   (nula.hk)
+##
+
+func D() { return chr(36); }
+func dollars($text) { return replace($text, "@", D()); }
+
+func bridgeDir($m) { return Project.cacheDir($m) . "/bridge"; }
+
+# ───────────────── IDL: znaczniki → funkcje ─────────────────
+func mapType($t, $lang) {
+    $t = trim($t);
+    if ($t === "int" || $t === "i64") { return "int"; }
+    if ($t === "float" || $t === "f64") { return "float"; }
+    if ($t === "bool") { return "bool"; }
+    if ($t === "string") { return "string"; }
+    if ($t === "void" || $t === "null" || $t === "") { return "void"; }
+    throw new Exception("most: typ `" . $t . "` nie jest obsługiwany (dozwolone: int, float, bool, string, void)");
+}
+
+func nextSig($lines, $from) {
+    for ($j = $from; $j < count($lines); $j++) {
+        $t = trim($lines[$j]);
+        if ($t === "" || starts_with($t, ";;") || starts_with($t, "///") || starts_with($t, "#")) { continue; }
+        return [$t, $j + 1];
+    }
+    return null;
+}
+
+func fnHead($sig, $skip) {
+    $body = substr($sig, $skip);
+    $op = index_of($body, "(");
+    $cl = index_of($body, ")");
+    if ($op < 1 || $cl < $op) { throw new Exception("most: nie umiem odczytać sygnatury `" . $sig . "`"); }
+    $name = trim(substr($body, 0, $op));
+    if (index_of($name, "<") >= 0) { throw new Exception("most: funkcja generyczna `" . $name . "` nie może być eksportowana"); }
+    return ["name" => $name, "params" => trim(substr($body, $op + 1, $cl - $op - 1)), "tail" => trim(substr($body, $cl + 1))];
+}
+
+# H#:  pub fn nazwa(a: int, b: string) -> int is
+func parseH($sig, $file) {
+    if (!starts_with($sig, "pub fn ")) { throw new Exception($file . ": `;; nula:export` musi stać nad `pub fn ...` (jest: `" . $sig . "`)"); }
+    $h = fnHead($sig, 7);
+    $params = [];
+    if ($h["params"] !== "") {
+        foreach (split($h["params"], ",") as $p) {
+            $c = index_of($p, ":");
+            if ($c < 1) { throw new Exception($file . ": parametr `" . trim($p) . "` w `" . $h["name"] . "` wymaga typu (`nazwa: typ`)"); }
+            $params[] = [trim(substr($p, 0, $c)), mapType(substr($p, $c + 1), "h#")];
+        }
+    }
+    $ret = "void";
+    $tail = $h["tail"];
+    if (starts_with($tail, "->")) {
+        $r = trim(substr($tail, 2));
+        if (ends_with($r, " is")) { $r = trim(substr($r, 0, strlen($r) - 3)); }
+        $ret = mapType($r, "h#");
+    }
+    return ["lang" => "h#", "name" => $h["name"], "params" => $params, "ret" => $ret, "file" => $file];
+}
+
+# Z#:  func nazwa(int $a, string $b): int {
+func parseZ($sig, $file, $ns) {
+    if (!starts_with($sig, "func ") && !starts_with($sig, "function ")) { throw new Exception($file . ": `# nula:export` musi stać nad `func ...` (jest: `" . $sig . "`)"); }
+    if ($ns === "") { throw new Exception($file . ": eksportowana funkcja Z# musi leżeć w pliku z `namespace Nazwa;`"); }
+    $h = fnHead($sig, starts_with($sig, "func ") ? 5 : 9);
+    $params = [];
+    if ($h["params"] !== "") {
+        foreach (split($h["params"], ",") as $p) {
+            $p = trim($p);
+            $eq = index_of($p, "=");
+            if ($eq > 0) { $p = trim(substr($p, 0, $eq)); }
+            $sp = index_of($p, " ");
+            if ($sp < 1) { throw new Exception($file . ": parametr `" . $p . "` w `" . $h["name"] . "` wymaga typu (`typ " . D() . "nazwa`)"); }
+            $n = trim(substr($p, $sp + 1));
+            if (starts_with($n, D())) { $n = substr($n, 1); }
+            $params[] = [$n, mapType(substr($p, 0, $sp), "z#")];
+        }
+    }
+    $ret = "void";
+    $tail = $h["tail"];
+    if (starts_with($tail, ":")) {
+        $r = trim(substr($tail, 1));
+        if (ends_with($r, "{")) { $r = trim(substr($r, 0, strlen($r) - 1)); }
+        $ret = mapType($r, "z#");
+    }
+    return ["lang" => "z#", "name" => $h["name"], "params" => $params, "ret" => $ret, "file" => $file, "module" => $ns];
+}
+
+func nsOf($lines) {
+    foreach ($lines as $l) {
+        $t = trim($l);
+        if (starts_with($t, "namespace ")) {
+            $n = trim(substr($t, 10));
+            $semi = index_of($n, ";");
+            return $semi >= 0 ? trim(substr($n, 0, $semi)) : $n;
+        }
+    }
+    return "";
+}
+
+func stemOf($file) {
+    $b = Path.basename($file);
+    $dot = index_of($b, ".");
+    return $dot > 0 ? substr($b, 0, $dot) : $b;
+}
+
+func exports($files, $lang) {
+    $out = [];
+    $marker = $lang === "h#" ? ";; nula:export" : "# nula:export";
+    foreach ($files as $f) {
+        $lines = Util.lines(Os.readFile($f));
+        $ns = $lang === "z#" ? nsOf($lines) : "";
+        for ($i = 0; $i < count($lines); $i++) {
+            if (trim($lines[$i]) !== $marker) { continue; }
+            $s = nextSig($lines, $i + 1);
+            if ($s === null) { throw new Exception($f . ": `" . $marker . "` bez funkcji pod spodem"); }
+            $fn = $lang === "h#" ? parseH($s[0], $f) : parseZ($s[0], $f, $ns);
+            if ($lang === "h#") { $fn["module"] = stemOf($f); }
+            $out[] = $fn;
+        }
+    }
+    return $out;
+}
+
+func scan($m, $src) {
+    return ["h#" => exports($src["h#"], "h#"), "z#" => exports($src["z#"], "z#")];
+}
+
+func sigText($fn) {
+    $p = [];
+    foreach ($fn["params"] as $x) { $p[] = $x[0] . ": " . $x[1]; }
+    return $fn["name"] . "(" . join($p, ", ") . ") -> " . $fn["ret"];
+}
+
+func isScalar($fn) {
+    if ($fn["ret"] === "string") { return false; }
+    foreach ($fn["params"] as $p) { if ($p[1] === "string") { return false; } }
+    return true;
+}
+
+# transport dla eksportów H# używanych z Z#
+func transportFor($m, $hfns) {
+    $scalar = true;
+    foreach ($hfns as $f) { if (!isScalar($f)) { $scalar = false; } }
+    $t = $m["transport"];
+    if ($t === "static") {
+        if (!$scalar) { throw new Exception("[bridge] transport => static wymaga samych int/float/bool; w eksportach H# są stringi (użyj auto albo process)"); }
+        return "static";
+    }
+    if ($t === "process") { return "process"; }
+    if ($t !== "auto") { throw new Exception("[bridge] transport => `" . $t . "` (dozwolone: auto, static, process)"); }
+    return $scalar ? "static" : "process";
+}
+
+# ───────────────── generator: Z# facade dla eksportów H# ─────────────────
+func zParams($fn) {
+    $p = [];
+    foreach ($fn["params"] as $x) { $p[] = $x[1] . " " . D() . $x[0]; }
+    return join($p, ", ");
+}
+
+func zArgs($fn) {
+    $p = [];
+    foreach ($fn["params"] as $x) { $p[] = D() . $x[0]; }
+    return join($p, ", ");
+}
+
+func zRet($fn) { return $fn["ret"] === "void" ? "void" : $fn["ret"]; }
+
+func genFacade($hfns, $transport) {
+    $o = ["# GENEROWANE przez nulę (nula bridge) — nie edytuj. Warstwa Z# → H#, transport: " . $transport . ".", "namespace HBridge;", ""];
+    if (count($hfns) === 0) { $o[] = "# (brak eksportów H#: oznacz funkcje komentarzem `;; nula:export`)"; return join($o, "\n") . "\n"; }
+    if ($transport === "static") {
+        $o[] = "extern \"hside\" {";
+        foreach ($hfns as $f) { $o[] = "    func " . $f["name"] . "(" . zParams($f) . "): " . zRet($f) . ";"; }
+        $o[] = "}";
+        return join($o, "\n") . "\n";
+    }
+    $o[] = "import Std.Os;";
+    $o[] = "import Std.Path;";
+    $o[] = "";
+    $o[] = "func hsideBin() {";
+    $o[] = "    @d = Os.env(\"NULA_LIBS\", \"\");";
+    $o[] = "    if (@d === \"\") { @d = Path.dirname(Path.absolute(System.args()[0])) . \"/libs\"; }";
+    $o[] = "    return @d . \"/hside\";";
+    $o[] = "}";
+    $o[] = "";
+    $o[] = "func callH(@fn, @args) {";
+    $o[] = "    @argv = [@fn];";
+    $o[] = "    foreach (@args as @a) { @argv[] = strval(@a); }";
+    $o[] = "    @r = Process.run(hsideBin(), @argv);";
+    $o[] = "    if (@r[\"status\"] !== 0) { throw new Exception(\"hside \" . @fn . \": \" . trim(@r[\"stderr\"])); }";
+    $o[] = "    @o = @r[\"stdout\"];";
+    $o[] = "    if (ends_with(@o, \"\\n\")) { @o = substr(@o, 0, strlen(@o) - 1); }";
+    $o[] = "    return @o;";
+    $o[] = "}";
+    foreach ($hfns as $f) {
+        $call = "callH(\"" . $f["name"] . "\", [" . zArgs($f) . "])";
+        $o[] = "";
+        $o[] = "func " . $f["name"] . "(" . zParams($f) . "): " . zRet($f) . " {";
+        if ($f["ret"] === "int") { $o[] = "    return intval(" . $call . ");"; }
+        else if ($f["ret"] === "float") { $o[] = "    return floatval(" . $call . ");"; }
+        else if ($f["ret"] === "bool") { $o[] = "    return " . $call . " === \"true\";"; }
+        else if ($f["ret"] === "string") { $o[] = "    return " . $call . ";"; }
+        else { $o[] = "    " . $call . ";"; $o[] = "    return null;"; }
+        $o[] = "}";
+    }
+    return dollars(join($o, "\n") . "\n");
+}
+
+# ───────────────── generator: dispatcher H# (hside) ─────────────────
+func hConv($t, $expr) {
+    if ($t === "int") { return "conv::str_to_int(" . $expr . ")"; }
+    if ($t === "bool") { return "(" . $expr . " == \"true\")"; }
+    if ($t === "float") { throw new Exception("most: parametr float nie jest jeszcze obsługiwany w transporcie process po stronie H# (użyj static albo int/string)"); }
+    return $expr;
+}
+
+func genHside($hfns, $mods) {
+    $o = [";; GENEROWANE przez nulę (nula bridge) — dispatcher funkcji H# wywoływanych procesem: hside <fn> <arg>...",
+        "use \"std -> env\" from \"env\"", "use \"std -> conv\" from \"conv\""];
+    foreach ($mods as $mod) { $o[] = "mod " . $mod; }
+    $o[] = "";
+    $o[] = "fn nula_find(a: [string], name: string) -> int is";
+    $o[] = "    let mut i: int = 0";
+    $o[] = "    while i < a.len() is";
+    $o[] = "        if a[i] == name is return i end";
+    $o[] = "        i += 1";
+    $o[] = "    end";
+    $o[] = "    return -1";
+    $o[] = "end";
+    $o[] = "";
+    $o[] = "fn main() is";
+    $o[] = "    let a: [string] = env::args()";
+    foreach ($hfns as $f) {
+        $k = "k_" . $f["name"];
+        $o[] = "    let " . $k . ": int = nula_find(a, \"" . $f["name"] . "\")";
+        $o[] = "    if " . $k . " >= 0 is";
+        $args = [];
+        for ($i = 0; $i < count($f["params"]); $i++) { $args[] = hConv($f["params"][$i][1], "a[" . $k . " + " . ($i + 1) . "]"); }
+        $call = $f["module"] . "::" . $f["name"] . "(" . join($args, ", ") . ")";
+        if ($f["ret"] === "void") { $o[] = "        " . $call; }
+        else if ($f["ret"] === "string") { $o[] = "        write(" . $call . ")"; }
+        else { $o[] = "        write(to_string(" . $call . "))"; }
+        $o[] = "        return";
+        $o[] = "    end";
+    }
+    $o[] = "    write(\"hside: nieznana funkcja\")";
+    $o[] = "end";
+    return join($o, "\n") . "\n";
+}
+
+# ───────────────── generator: stub H# dla eksportów Z# ─────────────────
+func hType($t) { return $t === "float" ? "f64" : $t; }
+
+func genHStub($zfns) {
+    $o = [";; GENEROWANE przez nulę (nula bridge) — nie edytuj; plik jest w .gitignore.",
+        ";; Warstwa H# → Z#: każde wywołanie uruchamia `zside <fn> <arg>...` (katalog z $NULA_LIBS, ustawianym przez `nula run`).",
+        "use \"std -> process\" from \"proc\"", "use \"std -> env\" from \"env\"", "use \"std -> conv\" from \"conv\"", "use \"std -> strings\" from \"str\"", "",
+        "fn nula_q(s: string) -> string is",
+        "    return \"'\" + str::replace(s, \"'\", \"'\\\\''\") + \"'\"",
+        "end", "",
+        "fn nula_zside() -> string is",
+        "    return env::get(\"NULA_LIBS\") + \"/zside\"",
+        "end"];
+    foreach ($zfns as $f) {
+        $ps = [];
+        $cmd = ["nula_zside() + \" " . $f["name"] . "\""];
+        foreach ($f["params"] as $p) {
+            $ps[] = $p[0] . ": " . hType($p[1]);
+            $cmd[] = $p[1] === "string" ? "nula_q(" . $p[0] . ")" : "nula_q(to_string(" . $p[0] . "))";
+        }
+        $run = "proc::shell(" . join($cmd, " + \" \" + ") . ")";
+        $o[] = "";
+        $o[] = "pub fn " . $f["name"] . "(" . join($ps, ", ") . ")" . ($f["ret"] === "void" ? "" : " -> " . hType($f["ret"])) . " is";
+        if ($f["ret"] === "void") { $o[] = "    " . $run; }
+        else if ($f["ret"] === "string") { $o[] = "    return " . $run; }
+        else if ($f["ret"] === "int") { $o[] = "    return conv::str_to_int(str::trim(" . $run . "))"; }
+        else if ($f["ret"] === "bool") { $o[] = "    return str::trim(" . $run . ") == \"true\""; }
+        else { $o[] = "    return conv::str_to_f64(str::trim(" . $run . "))"; }
+        $o[] = "end";
+    }
+    return join($o, "\n") . "\n";
+}
+
+# ───────────────── generator: dispatcher Z# (zside) ─────────────────
+func zConv($t, $expr) {
+    if ($t === "int") { return "intval(" . $expr . ")"; }
+    if ($t === "float") { return "floatval(" . $expr . ")"; }
+    if ($t === "bool") { return "(" . $expr . " === \"true\")"; }
+    return $expr;
+}
+
+func genZside($zfns) {
+    $mods = [];
+    foreach ($zfns as $f) { $mods[] = $f["module"]; }
+    $o = ["# GENEROWANE przez nulę (nula bridge) — dispatcher funkcji Z# wywoływanych procesem: zside <fn> <arg>...", "import Std.Os;"];
+    foreach (Util.unique($mods) as $mod) { $o[] = "import Workspace." . $mod . ";"; }
+    $o[] = "";
+    $o[] = "func main(): int {";
+    $o[] = "    @a = Os.args();";
+    $o[] = "    if (count(@a) < 1) { eecho(\"zside: brak nazwy funkcji\"); return 2; }";
+    foreach ($zfns as $f) {
+        $args = [];
+        for ($i = 0; $i < count($f["params"]); $i++) { $args[] = zConv($f["params"][$i][1], "@a[" . ($i + 1) . "]"); }
+        $call = $f["module"] . "." . $f["name"] . "(" . join($args, ", ") . ")";
+        $o[] = "    if (@a[0] === \"" . $f["name"] . "\") {";
+        $o[] = $f["ret"] === "void" ? "        " . $call . ";" : "        echo " . $call . ";";
+        $o[] = "        return 0;";
+        $o[] = "    }";
+    }
+    $o[] = "    eecho(\"zside: nieznana funkcja \" . @a[0]);";
+    $o[] = "    return 2;";
+    $o[] = "}";
+    return dollars(join($o, "\n") . "\n");
+}
+
+# ───────────────── całość ─────────────────
+##
+ * Wywoływane przed budową, gdy w projekcie są oba języki. Zwraca opis dla Build:
+ * ["h" => [...], "z" => [...], "htransport" => static|process|none, "needZside" => bool,
+ *  "facade" => ścieżka HBridge.zsharp, "hsideMain" => ścieżka albo ""]
+##
+func generate($root, $m, $src) {
+    $ex = scan($m, $src);
+    $hfns = $ex["h#"];
+    $zfns = $ex["z#"];
+    $dir = bridgeDir($m);
+    Util.ensureDir($dir);
+    $info = ["h" => $hfns, "z" => $zfns, "htransport" => "none", "needZside" => count($zfns) > 0, "facade" => $dir . "/HBridge.zsharp", "hsideMain" => ""];
+
+    $idl = [];
+    foreach (array_merge_lists($hfns, $zfns) as $f) {
+        $p = [];
+        foreach ($f["params"] as $x) { $p[] = ["name" => $x[0], "type" => $x[1]]; }
+        $idl[] = ["lang" => $f["lang"], "module" => $f["module"], "name" => $f["name"], "params" => $p, "ret" => $f["ret"], "file" => $f["file"]];
+    }
+    Util.writeIfChanged($dir . "/bridge.json", Json.encodePretty(["version" => 1, "functions" => $idl]) . "\n");
+
+    if (count($hfns) > 0) {
+        $info["htransport"] = transportFor($m, $hfns);
+        if ($info["htransport"] === "process") {
+            $hdir = $dir . "/h";
+            Util.forceRemove($hdir);
+            Util.copyDir($root . "/" . $m["src"], $hdir);
+            $mods = [];
+            foreach ($hfns as $f) { $mods[] = $f["module"]; }
+            Util.writeIfChanged($hdir . "/hside_main.h#", genHside($hfns, Util.unique($mods)));
+            $info["hsideMain"] = $hdir . "/hside_main.h#";
+        }
+    }
+    Util.writeIfChanged($info["facade"], genFacade($hfns, $info["htransport"] === "none" ? "static" : $info["htransport"]));
+
+    $stub = $root . "/" . $m["src"] . "/nula_zbridge.h#";
+    if (count($zfns) > 0) {
+        Util.writeIfChanged($stub, genHStub($zfns));
+        Util.writeIfChanged($dir . "/zside_main.zsharp", genZside($zfns));
+    } else if (Os.isFile($stub)) {
+        Util.forceRemove($stub);
+    }
+    return $info;
+}
+
+func array_merge_lists($a, $b) {
+    $out = [];
+    foreach ($a as $x) { $out[] = $x; }
+    foreach ($b as $x) { $out[] = $x; }
+    return $out;
+}
+
+func describe($info) {
+    $out = [];
+    foreach ($info["h"] as $f) { $out[] = "H# → Z#  " . $f["module"] . "::" . sigText($f) . "  [" . $info["htransport"] . "]"; }
+    foreach ($info["z"] as $f) { $out[] = "Z# → H#  " . $f["module"] . "." . sigText($f) . "  [process]"; }
+    return $out;
+}
