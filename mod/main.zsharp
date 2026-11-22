@@ -1,1 +1,42 @@
+import Std.Os;
+import Workspace.Ui;
+import Workspace.Cli;
+import Workspace.Commands;
 
+func main(): int {
+    $valued = ["--lang", "--root", "--backend", "--transport", "-o", "--jobs"];
+    $p = Cli.parse(Os.args(), $valued);
+    if (Cli.has($p, "-v", "--verbose")) { Os.setEnv("NULA_VERBOSE", "1"); }
+    if (Cli.has($p, "-q", "--quiet")) { Os.setEnv("NULA_QUIET", "1"); }
+    if (Cli.has($p, "--no-color")) { Os.setEnv("NO_COLOR", "1"); }
+    if (Cli.has($p, "--offline")) { Os.setEnv("NULA_OFFLINE", "1"); }
+    if (Cli.has($p, "--version")) { echo Commands.version(); return 0; }
+    $cmd = $p["cmd"];
+    if ($cmd === "") { Commands.usage(); return Cli.has($p, "-h", "--help") ? 0 : 2; }
+    if (Cli.has($p, "-h", "--help") || $cmd === "help") { Commands.usage(); return 0; }
+    try {
+        if ($cmd === "version") { echo Commands.version(); return 0; }
+        if ($cmd === "new") { return Commands.cmdNew($p); }
+        if ($cmd === "init") { return Commands.cmdInit($p); }
+        if ($cmd === "install" || $cmd === "i") { return Commands.cmdInstall($p); }
+        if ($cmd === "update") { return Commands.cmdUpdate($p); }
+        if ($cmd === "outdated") { return Commands.cmdOutdated($p); }
+        if ($cmd === "tree") { return Commands.cmdTree($p); }
+        if ($cmd === "deps") { return Commands.cmdDeps($p); }
+        if ($cmd === "pin") { return Commands.cmdPin($p); }
+        if ($cmd === "search") { return Commands.cmdSearch($p); }
+        if ($cmd === "build" || $cmd === "b") { return Commands.cmdBuild($p); }
+        if ($cmd === "run" || $cmd === "r") { return Commands.cmdRun($p); }
+        if ($cmd === "check") { return Commands.cmdCheck($p); }
+        if ($cmd === "test") { return Commands.cmdTest($p); }
+        if ($cmd === "clean") { return Commands.cmdClean($p); }
+        if ($cmd === "bridge") { return Commands.cmdBridge($p); }
+        if ($cmd === "script") { return Commands.cmdScript($p); }
+        if ($cmd === "doctor") { return Commands.cmdDoctor($p); }
+    } catch (Exception $e) {
+        Ui.error($e->getMessage());
+        return 1;
+    }
+    eecho("nula: nieznane polecenie `" . $cmd . "` (nula help)");
+    return 2;
+}
