@@ -1,0 +1,165 @@
+namespace Fetch;
+
+import Std.Os;
+import Std.Path;
+import Workspace.Util;
+import Workspace.Ui;
+import Workspace.Semver;
+import Workspace.Registry;
+import Workspace.Project;
+
+##
+ * Fetch — pobieranie źródeł pakietu do wspólnego store i podpinanie ich w projekcie.
+ *
+ *   git:   ls-remote → wybór tagu (zakres semver) albo rev → płytki clone → .git usunięty →
+ *          store/<nazwa>/<12 znaków commita>/ (zapis atomowy przez rename)
+ *   path:  zależność lokalna używana wprost (bez kopiowania — do pracy nad kilkoma projektami naraz)
+ *
+ *   link:  <projekt>/build/libs/<nazwa>/current → katalog w store. Taki układ czytają: kompilator H#
+ *          (przez BIT_HOME), hlpp (`# <bit/nazwa>` → <BIT_HOME>/<nazwa>/current) i wygenerowane Z#.toml.
+##
+
+func tab() { return chr(9); }
+
+# tag → commit (tagi adnotowane: wygrywa wpis `^{}`, czyli commit)
+func tags($url) {
+    $r = Util.run("git", ["ls-remote", "--tags", $url]);
+    if ($r["status"] !== 0) { throw new Exception("git ls-remote " . $url . ": " . trim($r["stderr"])); }
+    $map = [];
+    foreach (Util.lines($r["stdout"]) as $l) {
+        $p = split($l, tab());
+        if (count($p) < 2 || !starts_with($p[1], "refs/tags/")) { continue; }
+        $name = substr($p[1], 10);
+        $peeled = ends_with($name, "^{}");
+        if ($peeled) { $name = substr($name, 0, strlen($name) - 3); }
+        if ($peeled || !has_key($map, $name)) { $map[$name] = trim($p[0]); }
+    }
+    return $map;
+}
+
+func remoteSha($url, $ref) {
+    $r = Util.run("git", ["ls-remote", $url, $ref]);
+    if ($r["status"] !== 0) { throw new Exception("git ls-remote " . $url . " " . $ref . ": " . trim($r["stderr"])); }
+    foreach (Util.lines($r["stdout"]) as $l) {
+        $p = split($l, tab());
+        if (count($p) >= 2 && trim($p[0]) !== "") { return trim($p[0]); }
+    }
+    return null;
+}
+
+func lockUsable($locked, $d) {
+    if ($locked["source"] !== $d["git"]) { return false; }
+    if ($d["rev"] !== "" && $locked["rev"] !== $d["rev"]) { return false; }
+    if ($d["req"] !== "") {
+        $v = Semver.parse($locked["version"]);
+        if ($v === null || !Semver.satisfies($v, $d["req"])) { return false; }
+    }
+    return true;
+}
+
+func entryFor($d, $version, $commit, $checksum, $path, $kind) {
+    return ["name" => $d["name"], "version" => $version, "commit" => $commit, "source" => $kind === "path" ? "path:" . $d["path"] : $d["git"],
+        "rev" => $d["rev"], "dir" => $d["dir"], "req" => $d["req"], "checksum" => $checksum, "path" => $path, "kind" => $kind];
+}
+
+func localPath($d, $base) {
+    $p = $d["path"];
+    if (starts_with($p, "~/")) { $p = Os.home() . substr($p, 1); }
+    if (!Path.isAbs($p)) { $p = Path.normalize(Path.join($base, $p)); }
+    return $p;
+}
+
+# $locked — wpis z nula.lock albo null; zwraca wpis z polem "path" (katalog źródeł)
+func install($d, $base, $locked, $offline) {
+    $name = $d["name"];
+    if ($d["kind"] === "path") {
+        $p = localPath($d, $base);
+        if (!Os.isDir($p)) { throw new Exception("zależność `" . $name . "`: katalog " . $p . " nie istnieje"); }
+        return entryFor($d, "path", "", "", $p, "path");
+    }
+    $url = $d["git"];
+    if ($locked !== null && has_key($locked, "commit") && lockUsable($locked, $d)) {
+        $dest = Registry.storeDir($name, $locked["commit"]);
+        if (Os.isDir($dest)) {
+            $e = entryFor($d, $locked["version"], $locked["commit"], $locked["checksum"], $dest, "git");
+            return $e;
+        }
+    }
+    if ($offline) { throw new Exception("tryb offline: `" . $name . "` nie ma w store ani w nula.lock"); }
+
+    # 1. który ref?
+    $ref = $d["rev"];
+    $version = "";
+    $tagMap = tags($url);
+    if ($ref === "") {
+        $names = keys($tagMap);
+        $t = $d["req"] !== "" ? Semver.maxSatisfying($names, $d["req"]) : Semver.latest($names);
+        if ($t === null && $d["req"] !== "") { throw new Exception("`" . $name . "`: żaden tag w " . $url . " nie spełnia `" . $d["req"] . "`"); }
+        if ($t !== null) { $ref = $t; }
+    }
+    if ($ref !== "" && has_key($tagMap, $ref)) { $version = $ref; }
+
+    # 2. commit
+    $byCommit = $ref !== "" && !has_key($tagMap, $ref) && strlen($ref) >= 7 && Util.isHex($ref);
+    $commit = "";
+    if ($byCommit) { $commit = $ref; }
+    else if ($ref !== "" && has_key($tagMap, $ref)) { $commit = $tagMap[$ref]; }
+    else { $commit = remoteSha($url, $ref === "" ? "HEAD" : $ref) ?? ""; }
+    if ($commit === "") { throw new Exception("`" . $name . "`: nie znaleziono ref `" . $ref . "` w " . $url); }
+
+    $dest = Registry.storeDir($name, $commit);
+    if (!Os.isDir($dest)) {
+        Ui.step("Pobieranie", $name . ($version !== "" ? " " . $version : "") . " (" . Util.firstChars($commit, 8) . ") z " . $url);
+        $tmp = Registry.storeRoot() . "/.tmp-" . Os.pid() . "-" . $name;
+        Util.forceRemove($tmp);
+        Util.ensureDir(Registry.storeRoot());
+        $args = ["clone", "--quiet"];
+        if (!$byCommit) { $args[] = "--depth"; $args[] = "1"; if ($ref !== "") { $args[] = "--branch"; $args[] = $ref; } }
+        $args[] = $url;
+        $args[] = $tmp;
+        $r = Util.run("git", $args);
+        if ($r["status"] !== 0) { Util.forceRemove($tmp); throw new Exception("git clone " . $url . ": " . trim($r["stderr"])); }
+        if ($byCommit) {
+            $c = Util.run("git", ["-C", $tmp, "checkout", "--quiet", $commit]);
+            if ($c["status"] !== 0) { Util.forceRemove($tmp); throw new Exception("git checkout " . $commit . ": " . trim($c["stderr"])); }
+        }
+        $head = Util.capture("git", ["-C", $tmp, "rev-parse", "HEAD"]);
+        if ($head !== null && $head !== "" && !starts_with($head, Util.firstChars($commit, 7))) {
+            Util.forceRemove($tmp);
+            throw new Exception("`" . $name . "`: commit po pobraniu (" . $head . ") nie zgadza się z zapowiedzianym (" . $commit . ")");
+        }
+        Util.forceRemove($tmp . "/.git");
+        $from = $d["dir"] !== "" ? $tmp . "/" . $d["dir"] : $tmp;
+        if (!Os.isDir($from)) { Util.forceRemove($tmp); throw new Exception("`" . $name . "`: w repozytorium nie ma katalogu `" . $d["dir"] . "`"); }
+        Util.ensureDir(Path.dirname($dest));
+        Os.rename($from, $dest);
+        Util.forceRemove($tmp);
+    } else {
+        Ui.verbose("store: " . $dest);
+    }
+    $sum = Util.sha256Dir($dest);
+    if ($locked !== null && has_key($locked, "commit") && $locked["commit"] === $commit && $locked["checksum"] !== "" && $locked["checksum"] !== $sum) {
+        throw new Exception("`" . $name . "`: suma kontrolna " . $dest . " nie zgadza się z nula.lock (źródła zmienione po pobraniu?)");
+    }
+    return entryFor($d, $version, $commit, $sum, $dest, "git");
+}
+
+# build/libs/<nazwa>/current → źródła pakietu
+func link($m, $e) {
+    return Util.linkTo($e["path"], Project.libsDir($m) . "/" . $e["name"] . "/current");
+}
+
+# usuwa z build/libs podkatalogi pakietów, których już nie ma w $keep (pliki mostka zostają)
+func prune($m, $keep) {
+    $dir = Project.libsDir($m);
+    if (!Os.isDir($dir)) { return 0; }
+    $n = 0;
+    foreach (Os.list($dir) as $name) {
+        $p = $dir . "/" . $name;
+        if (Os.isDir($p) && !in_array($name, $keep) && Os.stat($p . "/current") !== null) {
+            Util.forceRemove($p);
+            $n++;
+        }
+    }
+    return $n;
+}
