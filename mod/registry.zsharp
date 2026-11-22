@@ -1,0 +1,171 @@
+namespace Registry;
+
+import Std.Os;
+import Std.Path;
+import Std.Json;
+import Workspace.Util;
+import Workspace.Hk;
+import Workspace.Ui;
+import Workspace.Semver;
+
+##
+ * Registry — skąd nula bierze pakiety.
+ *   1. [pins] w nula.hk (git / path / rev / zakres wersji)           — zawsze wygrywa
+ *   2. indeksy: $NULA_INDEX (lista po przecinku) albo [registry] index w nula.hk, a na końcu indeks bit.io
+ *      (ten sam repository.json, więc biblioteki H# / Hacker Lang z bit są od razu dostępne)
+ *   3. adresy podane wprost w kodzie (github.com/u/repo, # <github/u/repo>)
+ * Pobieranie przez `curl` i `git` — Std.Net w Z# nie ma TLS.
+ *
+ * Katalogi:  $NULA_HOME (domyślnie ~/.hackeros/nula)/{store,cache}
+ *   store/<nazwa>/<12 znaków commita>/   niezmienne źródła pakietów (wspólne dla projektów)
+ *   cache/index-<hash>.json              pobrane indeksy
+##
+
+func defaultIndex() { return "https://raw.githubusercontent.com/HackerOS-Linux-System/bit/main/index/repository.json"; }
+
+func home() { return Os.env("NULA_HOME", Os.home() . "/.hackeros/nula"); }
+func storeRoot() { return home() . "/store"; }
+func cacheRoot() { return home() . "/cache"; }
+
+func storeDir($name, $commit) { return storeRoot() . "/" . $name . "/" . Util.firstChars($commit, 12); }
+
+func indexUrls($m) {
+    $env = Os.env("NULA_INDEX", "");
+    if ($env !== "") {
+        $out = [];
+        foreach (split($env, ",") as $u) { if (trim($u) !== "") { $out[] = trim($u); } }
+        return $out;
+    }
+    $out = [];
+    foreach (Hk.asList(Hk.get($m["doc"], "registry", "index", [])) as $u) { $out[] = $u; }
+    $out[] = defaultIndex();
+    return $out;
+}
+
+func isLocalUrl($u) { return starts_with($u, "/") || starts_with($u, "./") || starts_with($u, "file://"); }
+
+# treść jednego indeksu (z cache; odświeżana co 6 h; offline = tylko cache)
+func fetchIndex($url, $offline) {
+    if (isLocalUrl($url)) {
+        $p = starts_with($url, "file://") ? substr($url, 7) : $url;
+        return Os.readFile($p);
+    }
+    Util.ensureDir(cacheRoot());
+    $f = cacheRoot() . "/index-" . Util.firstChars(Util.sha256Text($url), 12) . ".json";
+    if ($offline) {
+        if (!Os.isFile($f)) { throw new Exception("tryb offline: brak zapisanego indeksu " . $url); }
+        return Os.readFile($f);
+    }
+    if (Util.olderThanMin($f, 360)) {
+        $r = Util.run("curl", ["-fsSL", "--retry", "3", "--max-time", "60", "-o", $f . ".tmp", $url]);
+        if ($r["status"] === 0) { Os.rename($f . ".tmp", $f); }
+        else if (Os.isFile($f)) { Ui.warn("nie udało się odświeżyć indeksu " . $url . " — używam zapisanej kopii"); }
+        else { throw new Exception("nie można pobrać indeksu " . $url . ": " . trim($r["stderr"])); }
+    }
+    return Os.readFile($f);
+}
+
+# wszystkie biblioteki ze wszystkich indeksów (pierwszy indeks wygrywa przy tej samej nazwie)
+func libraries($m, $offline) {
+    $out = [];
+    $seen = [];
+    foreach (indexUrls($m) as $url) {
+        $doc = null;
+        try { $doc = Json.decode(fetchIndex($url, $offline)); }
+        catch (Exception $e) { Ui.warn("indeks " . $url . ": " . $e->getMessage()); continue; }
+        $list = is_array($doc) && has_key($doc, "libraries") ? $doc["libraries"] : $doc;
+        if (!is_array($list)) { continue; }
+        foreach ($list as $e) {
+            if (!is_array($e) || !has_key($e, "name") || !has_key($e, "target")) { continue; }
+            if (has_key($seen, $e["name"])) { continue; }
+            $seen[$e["name"]] = true;
+            $out[] = $e;
+        }
+    }
+    return $out;
+}
+
+# target z indeksu: repo | .../tree/<ref>/<katalog> | repo#katalog | ścieżka lokalna → [url, ref, dir, kind]
+func parseTarget($t, $entry) {
+    $ref = has_key($entry, "rev") ? $entry["rev"] : "";
+    $dir = has_key($entry, "dir") ? $entry["dir"] : "";
+    if (isLocalUrl($t) || starts_with($t, "~/")) { return [$t, $ref, $dir, "path"]; }
+    $i = index_of($t, "/tree/");
+    if ($i > 0) {
+        $rest = split(substr($t, $i + 6), "/");
+        $t = substr($t, 0, $i);
+        if ($ref === "") { $ref = $rest[0]; }
+        if ($dir === "" && count($rest) > 1) { $dir = join(array_slice($rest, 1), "/"); }
+    }
+    $h = index_of($t, "#");
+    if ($h > 0) {
+        if ($dir === "") { $dir = substr($t, $h + 1); }
+        $t = substr($t, 0, $h);
+    }
+    if (ends_with($t, ".git")) { $t = substr($t, 0, strlen($t) - 4); }
+    if ($ref === "main" || $ref === "master" || $ref === "HEAD") { $ref = ""; }
+    return [$t, $ref, $dir, "git"];
+}
+
+func findEntry($libs, $name) {
+    foreach ($libs as $e) { if ($e["name"] === $name) { return $e; } }
+    $l = lower($name);
+    foreach ($libs as $e) { if (lower($e["name"]) === $l) { return $e; } }
+    return null;
+}
+
+# ───────────────── piny ─────────────────
+##
+ * Forma tekstowa:  ^1.2 | ~1.2.3 | >=1.0 <2.0 | rev v1.0 | git <url> [rev] | path ../x
+ * Forma mapy (`-> x` + `--> klucz => wartość`): git, path, rev, dir, version (alias: req)
+##
+func applyPin($d, $pin) {
+    if ($pin === null) { return $d; }
+    if (is_array($pin)) {
+        foreach (["path", "git", "rev", "dir"] as $k) { if (has_key($pin, $k)) { $d[$k] = $pin[$k]; } }
+        if (has_key($pin, "version")) { $d["req"] = $pin["version"]; }
+        if (has_key($pin, "req")) { $d["req"] = $pin["req"]; }
+        if ($d["path"] !== "") { $d["kind"] = "path"; } else if ($d["git"] !== "") { $d["kind"] = "git"; }
+        return $d;
+    }
+    $s = trim(strval($pin));
+    if ($s === "" || $s === "*" || $s === "newest") { return $d; }
+    if (starts_with($s, "path ")) { $d["path"] = trim(substr($s, 5)); $d["kind"] = "path"; return $d; }
+    if (starts_with($s, "rev ")) { $d["rev"] = trim(substr($s, 4)); return $d; }
+    if (starts_with($s, "git ")) {
+        $parts = split(trim(substr($s, 4)), " ");
+        $d["git"] = $parts[0];
+        $d["kind"] = "git";
+        if (count($parts) > 1) { $d["rev"] = $parts[1]; }
+        return $d;
+    }
+    if (!Semver.valid($s)) { throw new Exception("pin `" . $d["name"] . " => " . $s . "` nie jest zakresem wersji, `rev X`, `git URL` ani `path P`"); }
+    $d["req"] = $s;
+    return $d;
+}
+
+# uzupełnia zależność o źródło (git/path) z indeksu; błąd, gdy pakietu nie ma
+func complete($d, $libs) {
+    if ($d["kind"] !== "registry") { return $d; }
+    $e = findEntry($libs, $d["name"]);
+    if ($e === null) {
+        throw new Exception("nie znaleziono pakietu `" . $d["name"] . "` (importowany w " . $d["file"] . "). Dodaj go do [pins] w nula.hk, np. `-> " . $d["name"] . " => git https://github.com/u/repo`, albo ustaw NULA_INDEX.");
+    }
+    $t = parseTarget($e["target"], $e);
+    if ($t[3] === "path") { $d["path"] = $t[0]; $d["kind"] = "path"; return $d; }
+    $d["kind"] = "git";
+    $d["git"] = $t[0];
+    if ($d["rev"] === "") { $d["rev"] = $t[1]; }
+    if ($d["dir"] === "") { $d["dir"] = $t[2]; }
+    return $d;
+}
+
+func search($libs, $q) {
+    $q = lower($q);
+    $out = [];
+    foreach ($libs as $e) {
+        $hay = lower($e["name"] . " " . (has_key($e, "description") ? $e["description"] : "") . " " . (has_key($e, "tags") && is_array($e["tags"]) ? join($e["tags"], " ") : ""));
+        if (contains($hay, $q)) { $out[] = $e; }
+    }
+    return $out;
+}
