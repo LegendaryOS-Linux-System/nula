@@ -1,0 +1,135 @@
+namespace Semver;
+
+##
+ * Semver — wersje MAJOR.MINOR.PATCH i zakresy zgodne z bit/cargo:
+ *   *   ^1.2.3   ~1.2.3   >=1.0 <2.0   1.x   1.2.x   =1.2.3   1.2.3 (dokładnie)   1.2 (jak ~1.2)
+ * Tagi git: `v1.2.3` albo `1.2.3`; wydania wstępne (1.2.3-rc1) są pomijane.
+##
+
+func digits($s) {
+    if ($s === "") { return false; }
+    for ($i = 0; $i < strlen($s); $i++) { if (!is_digit(substr($s, $i, 1))) { return false; } }
+    return true;
+}
+
+# [major, minor, patch] albo null
+func parse($s) {
+    $s = trim($s);
+    if (starts_with($s, "v") || starts_with($s, "V")) { $s = substr($s, 1); }
+    $p = split($s, ".");
+    if (count($p) > 3) { return null; }
+    $out = [];
+    foreach ($p as $x) {
+        if (!digits($x)) { return null; }
+        $out[] = intval($x);
+    }
+    while (count($out) < 3) { $out[] = 0; }
+    return $out;
+}
+
+func compare($a, $b) {
+    for ($i = 0; $i < 3; $i++) {
+        if ($a[$i] !== $b[$i]) { return $a[$i] < $b[$i] ? -1 : 1; }
+    }
+    return 0;
+}
+
+func text($v) { return $v[0] . "." . $v[1] . "." . $v[2]; }
+
+# "1", "1.2", "1.2.3", "1.x", "*" → ["n" => liczba stałych członów, "v" => [a, b, c]] albo null
+func partial($s) {
+    $s = trim($s);
+    if (starts_with($s, "v")) { $s = substr($s, 1); }
+    $p = split($s, ".");
+    if (count($p) > 3) { return null; }
+    $v = [];
+    $n = 0;
+    $wild = false;
+    foreach ($p as $x) {
+        if ($x === "x" || $x === "X" || $x === "*") { $wild = true; $v[] = 0; continue; }
+        if ($wild || !digits($x)) { return null; }
+        $v[] = intval($x);
+        $n++;
+    }
+    while (count($v) < 3) { $v[] = 0; }
+    return ["n" => $n, "v" => $v];
+}
+
+func bounds($lo, $hi) { return [[">=", $lo], ["<", $hi]]; }
+
+# jeden człon zakresu → lista komparatorów [[op, wersja], ...] albo null
+func one($t) {
+    $op = "";
+    $body = $t;
+    foreach (["^", "~", ">=", "<=", ">", "<", "="] as $o) {
+        if (starts_with($t, $o)) { $op = $o; $body = substr($t, strlen($o)); break; }
+    }
+    $p = partial($body);
+    if ($p === null) { return null; }
+    $v = $p["v"];
+    $n = $p["n"];
+    if ($op === ">=" || $op === ">" || $op === "<=" || $op === "<") { return [[$op, $v]]; }
+    if ($op === "=") { return $n === 3 ? [["=", $v]] : one(substr($t, 1)); }
+    if ($op === "^") {
+        if ($n === 0) { return []; }
+        if ($v[0] > 0 || $n === 1) { return bounds($v, [$v[0] + 1, 0, 0]); }
+        if ($v[1] > 0 || $n === 2) { return bounds($v, [0, $v[1] + 1, 0]); }
+        return bounds($v, [0, 0, $v[2] + 1]);
+    }
+    if ($op === "~") {
+        if ($n === 0) { return []; }
+        if ($n === 1) { return bounds($v, [$v[0] + 1, 0, 0]); }
+        return bounds($v, [$v[0], $v[1] + 1, 0]);
+    }
+    # bez operatora: 1.2.3 = dokładnie, 1.2 / 1.x = zakres
+    if ($n === 3) { return [["=", $v]]; }
+    if ($n === 0) { return []; }
+    if ($n === 1) { return bounds($v, [$v[0] + 1, 0, 0]); }
+    return bounds($v, [$v[0], $v[1] + 1, 0]);
+}
+
+# tekst zakresu → lista komparatorów (pusta = wszystko) albo null przy błędzie
+func comparators($req) {
+    $req = trim($req);
+    if ($req === "" || $req === "*" || $req === "newest") { return []; }
+    $out = [];
+    foreach (split(replace($req, ",", " "), " ") as $tok) {
+        if ($tok === "") { continue; }
+        $c = one($tok);
+        if ($c === null) { return null; }
+        foreach ($c as $x) { $out[] = $x; }
+    }
+    return $out;
+}
+
+func valid($req) { return comparators($req) !== null; }
+
+func satisfies($v, $req) {
+    $cs = comparators($req);
+    if ($cs === null) { return false; }
+    foreach ($cs as $c) {
+        $d = compare($v, $c[1]);
+        $op = $c[0];
+        if ($op === ">=" && $d < 0) { return false; }
+        if ($op === ">" && $d <= 0) { return false; }
+        if ($op === "<=" && $d > 0) { return false; }
+        if ($op === "<" && $d >= 0) { return false; }
+        if ($op === "=" && $d !== 0) { return false; }
+    }
+    return true;
+}
+
+# najnowszy tag (tekst) spełniający zakres albo null
+func maxSatisfying($tags, $req) {
+    $best = null;
+    $bestTag = null;
+    foreach ($tags as $t) {
+        $v = parse($t);
+        if ($v === null) { continue; }
+        if (!satisfies($v, $req)) { continue; }
+        if ($best === null || compare($v, $best) > 0) { $best = $v; $bestTag = $t; }
+    }
+    return $bestTag;
+}
+
+func latest($tags) { return maxSatisfying($tags, "*"); }
